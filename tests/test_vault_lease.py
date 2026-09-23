@@ -272,3 +272,30 @@ def test_valid_dotted_vault_secret_path_is_supported(setup) -> None:
     fake, client, _store = setup
     fake.secrets["services/dev.worker"] = {"value": "present"}
     assert client.read_secret("services/dev.worker")["value"] == "present"
+
+
+def test_explicit_ca_bundle_is_used_for_vault_tls(setup, tmp_path: Path) -> None:
+    fake, client, _store = setup
+    ca_file = tmp_path / "vault-ca.pem"
+    ca_file.write_text("synthetic certificate fixture")
+    configured = VaultClient(
+        address=client.address,
+        role_id_file=client.role_id_file,
+        secret_id_file=client.secret_id_file,
+        mount=client.mount,
+        ca_cert_file=ca_file,
+    )
+    captured = []
+    context = object()
+
+    def open_with_context(request, timeout, **kwargs):
+        captured.append(kwargs.get("context"))
+        return fake.urlopen(request, timeout)
+
+    with (
+        mock.patch("ssl.create_default_context", return_value=context) as defaults,
+        mock.patch("urllib.request.urlopen", side_effect=open_with_context),
+    ):
+        configured.read_secret("webhooks/coder")
+    defaults.assert_called_with(cafile=str(ca_file))
+    assert captured == [context, context]
