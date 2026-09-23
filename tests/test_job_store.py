@@ -4,6 +4,7 @@ import os
 import sqlite3
 import stat
 import subprocess
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -84,6 +85,7 @@ def test_transitions_are_atomic_and_restart_is_uncertain(tmp_path: Path, context
         store.advance("job-123", "dispatching")
     assert store.get("job-123").state == "queued"
     store.advance("job-123", "lease_held")
+    store.record_token_expiry("job-123", datetime.now(UTC) + timedelta(hours=1))
     store.advance("job-123", "dispatching")
     store.close()
 
@@ -100,7 +102,9 @@ def test_dispatched_job_is_uncertain_after_restart_and_never_requeued(
 ) -> None:
     store = new_store(tmp_path)
     create_job(store, context)
-    for state in ("lease_held", "dispatching", "dispatched"):
+    store.advance("job-123", "lease_held")
+    store.record_token_expiry("job-123", datetime.now(UTC) + timedelta(hours=1))
+    for state in ("dispatching", "dispatched"):
         store.advance("job-123", state)
     store.close()
 
@@ -204,3 +208,90 @@ def test_two_jobs_cannot_reuse_a_control_branch_or_artifact(tmp_path: Path, cont
         )
     assert store.get("job-456") is None
     store.close()
+
+
+def test_dispatch_requires_durable_nonsecret_token_expiry(tmp_path: Path, context) -> None:
+    store = new_store(tmp_path)
+    create_job(store, context)
+    store.advance("job-123", "lease_held")
+    with pytest.raises(JobStateError, match="expiry"):
+        store.advance("job-123", "dispatching")
+    expires = datetime.now(UTC) + timedelta(hours=1)
+    store.record_token_expiry("job-123", expires)
+    assert store.get("job-123").token_expires_at == expires
+    with pytest.raises(JobStateError):
+        store.record_token_expiry("job-123", expires)
+    store.advance("job-123", "dispatching")
+    store.close()
+
+    reopened = JobStore.open(tmp_path / "private" / "jobs.sqlite3")
+    assert reopened.reconcile_restart() == ("job-123",)
+    assert reopened.get("job-123").state == "uncertain"
+    assert reopened.get("job-123").token_expires_at == expires
+    reopened.close()
+
+
+def test_rejects_naive_or_short_token_expiry(tmp_path: Path, context) -> None:
+    store = new_store(tmp_path)
+    create_job(store, context)
+    store.advance("job-123", "lease_held")
+    for expires in (datetime.now(), datetime.now(UTC) + timedelta(minutes=5)):
+        with pytest.raises(JobStateError, match="expiry"):
+            store.record_token_expiry("job-123", expires)
+    assert store.get("job-123").token_expires_at is None
+    store.close()
+
+
+@pytest.mark.parametrize("prior_state", ["queued", "dispatching"])
+def test_schema_v1_journal_migrates_without_losing_jobs(
+    tmp_path: Path, context, prior_state: str
+) -> None:
+    directory = tmp_path / "private"
+    directory.mkdir(mode=0o700)
+    db = directory / "jobs.sqlite3"
+    connection = sqlite3.connect(db)
+    connection.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+    connection.execute("INSERT INTO schema_version VALUES (1)")
+    connection.execute(
+        """CREATE TABLE jobs (
+            job_id TEXT PRIMARY KEY, worker_id TEXT NOT NULL,
+            lease_owner TEXT NOT NULL, root TEXT NOT NULL, target_repo TEXT NOT NULL,
+            head TEXT NOT NULL, branch TEXT NOT NULL, read_paths TEXT NOT NULL,
+            write_paths TEXT NOT NULL, snapshot_digest TEXT NOT NULL,
+            control_branch TEXT NOT NULL, artifact_path TEXT NOT NULL,
+            state TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )"""
+    )
+    now = datetime.now(UTC).isoformat()
+    connection.execute(
+        "INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "job-123",
+            "worker-a",
+            "codex-grokbot-mcp",
+            str(context.root),
+            context.target_repo,
+            context.head,
+            context.branch,
+            '["module.py"]',
+            '["module.py"]',
+            context.snapshot_digest,
+            "grokbot/job-coding-1234abcd",
+            "artifacts/patch-1234abcd.json",
+            prior_state,
+            now,
+            now,
+        ),
+    )
+    connection.commit()
+    connection.close()
+    db.chmod(0o600)
+
+    store = JobStore.open(db)
+    assert store.get("job-123").snapshot_digest == context.snapshot_digest
+    assert store.get("job-123").token_expires_at is None
+    assert store.reconcile_restart() == (("job-123",) if prior_state == "dispatching" else ())
+    assert store.get("job-123").state == ("uncertain" if prior_state == "dispatching" else "queued")
+    store.close()
+    with sqlite3.connect(db) as check:
+        assert check.execute("SELECT version FROM schema_version").fetchone()[0] == 2
