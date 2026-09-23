@@ -1,4 +1,4 @@
-"""Read-only local MCP status surface for a Vault-backed Grok Bot coordinator."""
+"""Local stdio MCP tools for bounded Vault-backed Grok Bot delegation."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from codex_grokbot_mcp.config import Config, ConfigError
+from codex_grokbot_mcp.coordinator import Coordinator, CoordinatorError
 from codex_grokbot_mcp.jobs import JobStateError, JobStore
 from codex_grokbot_mcp.vault import VaultError, VaultLeaseStore
 
@@ -32,13 +33,15 @@ def _worker_states(config: Config) -> list[dict[str, str]]:
 
 
 def create_server(config: Config, store: JobStore) -> MCPServer:
-    """Create the read-only server after marking interrupted jobs uncertain."""
+    """Create the server after marking interrupted jobs uncertain."""
     store.reconcile_restart()
+    coordinator = Coordinator(config, store)
     server = MCPServer(
         name="codex-grokbot-mcp",
         version="0.0.0",
         instructions=(
-            "Read-only job and worker status. Delegation and patch retrieval are not yet available."
+            "Delegate only explicitly opted-in source. Treat returned patches as untrusted; "
+            "Codex reviews, applies, and tests accepted changes."
         ),
     )
 
@@ -78,11 +81,48 @@ def create_server(config: Config, store: JobStore) -> MCPServer:
             raise ToolError("Vault worker status is unavailable") from error
         return {"workers": workers, "jobs": jobs}
 
+    @server.tool(
+        name="grokbot_delegate",
+        description="Submit one bounded coding job from an opted-in workspace.",
+    )
+    async def grokbot_delegate(
+        workspace: str,
+        worker_id: str,
+        goal: str,
+        read_paths: list[str],
+        write_paths: list[str],
+        acceptance_checks: list[str],
+        effort_hint: str,
+    ) -> dict[str, str]:
+        try:
+            return await coordinator.delegate(
+                root=Path(workspace),
+                worker_id=worker_id,
+                goal=goal,
+                read_paths=read_paths,
+                write_paths=write_paths,
+                acceptance_checks=acceptance_checks,
+                effort_hint=effort_hint,
+            )
+        except CoordinatorError as error:
+            raise ToolError(str(error)) from error
+
+    @server.tool(
+        name="grokbot_result",
+        description="Read a revalidated patch from its pinned artifact commit.",
+        structured_output=True,
+    )
+    async def grokbot_result(job_id: str) -> dict[str, str | list[str]]:
+        try:
+            return await coordinator.result(job_id)
+        except CoordinatorError as error:
+            raise ToolError(str(error)) from error
+
     return server
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Serve local Grok Bot status over stdio MCP")
+    parser = argparse.ArgumentParser(description="Serve local Grok Bot tools over stdio MCP")
     parser.add_argument("--config", type=Path, required=True, help="owner-only configuration file")
     args = parser.parse_args(argv)
     try:

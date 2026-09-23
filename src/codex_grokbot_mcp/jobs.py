@@ -18,10 +18,17 @@ from codex_grokbot_mcp.local import ContractError, DelegationContext, Workspace
 from codex_grokbot_mcp.vault import MAX_JOB_DURATION
 
 SCHEMA_VERSION = 3
-ACTIVE_STATES = ("lease_held", "dispatching", "dispatched", "artifact_received", "validated")
+ACTIVE_STATES = (
+    "queued",
+    "lease_held",
+    "dispatching",
+    "dispatched",
+    "artifact_received",
+    "validated",
+)
 NEXT_STATES = {
-    "queued": {"lease_held", "failed", "conflict"},
-    "lease_held": {"dispatching", "uncertain", "conflict"},
+    "queued": {"lease_held", "failed", "uncertain", "conflict"},
+    "lease_held": {"dispatching", "failed", "uncertain", "conflict"},
     "dispatching": {"dispatched", "uncertain", "conflict"},
     "dispatched": {"artifact_received", "uncertain", "conflict"},
     "artifact_received": {"validated", "uncertain", "conflict"},
@@ -360,7 +367,7 @@ class JobStore:
         """Retain evidence and block another POST or lease release after a crash."""
         with self._connection:
             rows = self._connection.execute(
-                "SELECT job_id FROM jobs WHERE state IN (?, ?, ?, ?, ?) ORDER BY job_id",
+                "SELECT job_id FROM jobs WHERE state IN (?, ?, ?, ?, ?, ?) ORDER BY job_id",
                 ACTIVE_STATES,
             ).fetchall()
             ids = tuple(row[0] for row in rows)

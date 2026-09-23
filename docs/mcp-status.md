@@ -6,4 +6,4 @@ The package's stdio entry point is `python -m codex_grokbot_mcp.server --config 
 
 `grokbot_active` returns configured workers and nonterminal local jobs. A worker is `busy` when its Vault lease is active, `available` when the CAS-protected lease is free and no uncertain local job exists, or `reconciliation_required` when a local uncertain job remains despite a free lease. A Vault or journal failure returns an MCP tool error; it never implies availability. This tool reads Vault metadata and lease records but makes no lease changes.
 
-These tools are observational. They do not dispatch a job, retry an uncertain webhook request, release a lease, retrieve a patch, or apply worker output. The delegation and result tools will be added only with the complete coordinator and its tests.
+These two tools are observational. They do not dispatch a job, retry an uncertain webhook request, release a lease, retrieve a patch, or apply worker output. See [the coordinator contract](mcp-coordinator.md) for the separate delegation and result tools.

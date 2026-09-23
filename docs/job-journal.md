@@ -16,7 +16,8 @@ not be copied into a worker packet or public issue.
 A job starts `queued`. State changes are checked against a fixed transition
 graph and committed atomically. The process records the token expiry, then `dispatching`, **before**
 the webhook POST. An expired or unrecorded token cannot enter `dispatching`. After a restart, the caller must run `reconcile_restart`
-before dispatching anything. Jobs whose lease or dispatch may still be active
+before dispatching anything. This includes `queued`: a process can claim a
+Vault lease and stop before recording `lease_held`. Jobs whose lease or dispatch may still be active
 become `uncertain`; they cannot be dispatched again or moved to `ready` by a
 normal transition. An operator or future reconciliation workflow must compare
 the saved job ID and worker against the live Vault lease and the exact control
