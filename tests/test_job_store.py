@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from codex_grokbot_mcp.jobs import JobStateError, JobStore
+from codex_grokbot_mcp.jobs import JobStateError, JobStore, artifact_digest
 from codex_grokbot_mcp.local import Workspace
 
 
@@ -294,4 +294,119 @@ def test_schema_v1_journal_migrates_without_losing_jobs(
     assert store.get("job-123").state == ("uncertain" if prior_state == "dispatching" else "queued")
     store.close()
     with sqlite3.connect(db) as check:
-        assert check.execute("SELECT version FROM schema_version").fetchone()[0] == 2
+        assert check.execute("SELECT version FROM schema_version").fetchone()[0] == 3
+
+
+def test_validated_artifact_identity_is_required_and_survives_restart(
+    tmp_path: Path, context
+) -> None:
+    store = new_store(tmp_path)
+    create_job(store, context)
+    store.advance("job-123", "lease_held")
+    store.record_token_expiry("job-123", datetime.now(UTC) + timedelta(hours=1))
+    for state in ("dispatching", "dispatched", "artifact_received"):
+        store.advance("job-123", state)
+    with pytest.raises(JobStateError, match="artifact identity"):
+        store.advance("job-123", "validated")
+    head_sha = "a" * 40
+    digest = "b" * 64
+    store.record_artifact_identity("job-123", head_sha, digest)
+    with pytest.raises(JobStateError, match="already recorded"):
+        store.record_artifact_identity("job-123", "c" * 40, "d" * 64)
+    store.advance("job-123", "validated")
+    store.advance("job-123", "ready")
+    store.close()
+
+    reopened = JobStore.open(tmp_path / "private" / "jobs.sqlite3")
+    record = reopened.get("job-123")
+    assert record.state == "ready"
+    assert record.artifact_head_sha == head_sha
+    assert record.artifact_sha256 == digest
+    assert reopened.reconcile_restart() == ()
+    reopened.close()
+
+
+def test_artifact_identity_rejects_invalid_values_and_wrong_state(tmp_path: Path, context) -> None:
+    store = new_store(tmp_path)
+    create_job(store, context)
+    with pytest.raises(JobStateError, match="artifact identity"):
+        store.record_artifact_identity("job-123", "a" * 40, "b" * 64)
+    store.advance("job-123", "lease_held")
+    store.record_token_expiry("job-123", datetime.now(UTC) + timedelta(hours=1))
+    for state in ("dispatching", "dispatched", "artifact_received"):
+        store.advance("job-123", state)
+    for head_sha, digest in (("not-a-sha", "b" * 64), ("a" * 40, "not-a-digest")):
+        with pytest.raises(JobStateError, match="artifact identity"):
+            store.record_artifact_identity("job-123", head_sha, digest)
+    assert store.get("job-123").artifact_head_sha is None
+    store.close()
+
+
+@pytest.mark.parametrize("prior_state", ["dispatched", "ready"])
+def test_schema_v2_journal_migrates_without_losing_dispatch_evidence(
+    tmp_path: Path, context, prior_state: str
+) -> None:
+    directory = tmp_path / "private"
+    directory.mkdir(mode=0o700)
+    db = directory / "jobs.sqlite3"
+    connection = sqlite3.connect(db)
+    connection.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+    connection.execute("INSERT INTO schema_version VALUES (2)")
+    connection.execute(
+        """CREATE TABLE jobs (
+            job_id TEXT PRIMARY KEY, worker_id TEXT NOT NULL,
+            lease_owner TEXT NOT NULL, root TEXT NOT NULL, target_repo TEXT NOT NULL,
+            head TEXT NOT NULL, branch TEXT NOT NULL, read_paths TEXT NOT NULL,
+            write_paths TEXT NOT NULL, snapshot_digest TEXT NOT NULL,
+            control_branch TEXT NOT NULL, artifact_path TEXT NOT NULL,
+            state TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            token_expires_at TEXT
+        )"""
+    )
+    now = datetime.now(UTC).isoformat()
+    expiry = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+    connection.execute(
+        "INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "job-123",
+            "worker-a",
+            "test-owner",
+            str(context.root),
+            context.target_repo,
+            context.head,
+            context.branch,
+            '["module.py"]',
+            '["module.py"]',
+            context.snapshot_digest,
+            "grokbot/job-coding-1234abcd",
+            "artifacts/patch-1234abcd.json",
+            prior_state,
+            now,
+            now,
+            expiry,
+        ),
+    )
+    connection.commit()
+    connection.close()
+    db.chmod(0o600)
+
+    store = JobStore.open(db)
+    assert store.reconcile_restart() == (("job-123",) if prior_state == "dispatched" else ())
+    record = store.get("job-123")
+    assert record.state == "uncertain"
+    assert record.token_expires_at.isoformat() == expiry
+    assert record.artifact_head_sha is None
+    assert record.artifact_sha256 is None
+    store.close()
+    with sqlite3.connect(db) as check:
+        assert check.execute("SELECT version FROM schema_version").fetchone()[0] == 3
+
+
+def test_artifact_digest_is_canonical_and_rejects_non_json_values() -> None:
+    one = {"job_id": "job-123", "paths": ["src/module.py"], "summary": "change"}
+    two = {"summary": "change", "paths": ["src/module.py"], "job_id": "job-123"}
+    assert artifact_digest(one) == artifact_digest(two)
+    assert len(artifact_digest(one)) == 64
+    assert artifact_digest({**one, "summary": "changed"}) != artifact_digest(one)
+    with pytest.raises(JobStateError, match="artifact"):
+        artifact_digest({"invalid": float("nan")})
