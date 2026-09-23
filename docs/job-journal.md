@@ -9,7 +9,7 @@ SQLite's full synchronous setting and transactional state updates.
 Each record contains a job and worker ID, lease owner, local workspace path,
 GitHub repository identity, Git HEAD and branch, selected read and write paths,
 a source-snapshot digest, control-repository branch and artifact path, state,
-and timestamps. It contains no source contents, Vault credential, GitHub token,
+and timestamps. Control branches and artifact paths are unique across jobs. It contains no source contents, Vault credential, GitHub token,
 App key, or webhook key. The workspace path is local private metadata and must
 not be copied into a worker packet or public issue.
 

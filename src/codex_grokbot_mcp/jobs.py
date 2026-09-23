@@ -139,6 +139,12 @@ class JobStore:
                     state TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
                 )"""
             )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS jobs_control_branch ON jobs(control_branch)"
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS jobs_artifact_path ON jobs(artifact_path)"
+            )
             connection.commit()
         except (sqlite3.Error, JobStateError) as error:
             if connection is not None:
@@ -190,7 +196,7 @@ class JobStore:
                     ),
                 )
         except sqlite3.IntegrityError as error:
-            raise JobStateError("job identifier already exists") from error
+            raise JobStateError("job identity or artifact coordinates already exist") from error
 
     def get(self, job_id: str) -> JobRecord | None:
         _identifier(job_id)

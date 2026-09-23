@@ -188,3 +188,19 @@ def test_database_open_failure_is_reported(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(sqlite3, "connect", denied)
     with pytest.raises(JobStateError, match="schema"):
         new_store(tmp_path)
+
+
+def test_two_jobs_cannot_reuse_a_control_branch_or_artifact(tmp_path: Path, context) -> None:
+    store = new_store(tmp_path)
+    create_job(store, context)
+    with pytest.raises(JobStateError, match="coordinates"):
+        store.create(
+            "job-456",
+            "worker-a",
+            context,
+            lease_owner="codex-grokbot-mcp",
+            control_branch="grokbot/job-coding-1234abcd",
+            artifact_path="artifacts/patch-1234abcd.json",
+        )
+    assert store.get("job-456") is None
+    store.close()
