@@ -1,6 +1,6 @@
 # Vault setup contract
 
-Vault is required for credentials and shared worker leasing. The runtime uses AppRole credentials in two local, regular files with owner-only permissions. It authenticates for each Vault operation and never stores a Vault token in durable job state. Vault TLS verification remains enabled.
+Vault is required for credentials and shared worker leasing. The runtime uses AppRole credentials in two local, regular files with owner-only permissions. It authenticates for each Vault operation and never stores a Vault token in durable job state. Vault TLS verification remains enabled. If the system Python trust store lacks the Vault CA, configure an explicit PEM CA bundle file (`VaultClient.ca_cert_file`); the runtime configuration should take this from its operator-supplied CA path. The Vault CLI's `VAULT_CACERT` environment variable does not automatically configure Python's TLS client.
 
 The operator chooses a KV v2 mount, credential paths, and one lease path per worker. A dedicated AppRole should have only these capabilities:
 

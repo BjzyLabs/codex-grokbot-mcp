@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import re
+import ssl
 import stat
 import urllib.error
 import urllib.request
@@ -99,6 +100,7 @@ class VaultClient:
     role_id_file: Path
     secret_id_file: Path
     mount: str
+    ca_cert_file: Path | None = None
 
     def __post_init__(self) -> None:
         parsed = urllib.parse.urlparse(self.address)
@@ -107,6 +109,8 @@ class VaultClient:
         if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
             raise VaultError("Vault address must not contain a path or query")
         _safe_path(self.mount, nested=False)
+        if self.ca_cert_file is not None and not self.ca_cert_file.is_file():
+            raise VaultError("Vault CA bundle file is unavailable")
 
     def _open(self, endpoint: str, *, method: str, payload: dict | None, token: str | None) -> dict:
         data = json.dumps(payload).encode("utf-8") if payload is not None else None
@@ -121,7 +125,10 @@ class VaultClient:
             method=method,
         )
         try:
-            with urllib.request.urlopen(request, timeout=15) as response:  # noqa: S310
+            options = {}
+            if self.ca_cert_file is not None:
+                options["context"] = ssl.create_default_context(cafile=str(self.ca_cert_file))
+            with urllib.request.urlopen(request, timeout=15, **options) as response:  # noqa: S310
                 raw = response.read(MAX_RESPONSE_BYTES + 1)
         except urllib.error.HTTPError as error:
             raise VaultHTTPError(error.code) from None
