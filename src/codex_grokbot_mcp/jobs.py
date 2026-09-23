@@ -11,10 +11,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from codex_grokbot_mcp.control import ARTIFACT_PATTERN, BRANCH_PATTERN
+from codex_grokbot_mcp.control import ARTIFACT_PATTERN, BRANCH_PATTERN, TOKEN_MINIMUM
 from codex_grokbot_mcp.local import ContractError, DelegationContext, Workspace
+from codex_grokbot_mcp.vault import MAX_JOB_DURATION
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 ACTIVE_STATES = ("lease_held", "dispatching", "dispatched", "artifact_received", "validated")
 NEXT_STATES = {
     "queued": {"lease_held", "failed", "conflict"},
@@ -99,6 +100,7 @@ class JobRecord:
     state: str
     created_at: str
     updated_at: str
+    token_expires_at: datetime | None
 
 
 class JobStore:
@@ -126,8 +128,9 @@ class JobStore:
                 connection.execute(
                     "INSERT INTO schema_version(version) VALUES (?)", (SCHEMA_VERSION,)
                 )
-            elif len(rows) != 1 or rows[0][0] != SCHEMA_VERSION:
+            elif len(rows) != 1 or rows[0][0] not in (1, SCHEMA_VERSION):
                 raise JobStateError("job store schema version is unsupported")
+            needs_migration = bool(rows and rows[0][0] == 1)
             connection.execute(
                 """CREATE TABLE IF NOT EXISTS jobs (
                     job_id TEXT PRIMARY KEY, worker_id TEXT NOT NULL,
@@ -136,9 +139,16 @@ class JobStore:
                     read_paths TEXT NOT NULL, write_paths TEXT NOT NULL,
                     snapshot_digest TEXT NOT NULL,
                     control_branch TEXT NOT NULL, artifact_path TEXT NOT NULL,
-                    state TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                    state TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    token_expires_at TEXT
                 )"""
             )
+            if needs_migration:
+                connection.execute("ALTER TABLE jobs ADD COLUMN token_expires_at TEXT")
+                connection.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(jobs)")}
+            if "token_expires_at" not in columns:
+                raise JobStateError("job store expiry column is missing")
             connection.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS jobs_control_branch ON jobs(control_branch)"
             )
@@ -176,7 +186,7 @@ class JobStore:
         try:
             with self._connection:
                 self._connection.execute(
-                    """INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    """INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         job_id,
                         worker_id,
@@ -193,6 +203,7 @@ class JobStore:
                         "queued",
                         now,
                         now,
+                        None,
                     ),
                 )
         except sqlite3.IntegrityError as error:
@@ -203,6 +214,13 @@ class JobStore:
         row = self._connection.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
         if row is None:
             return None
+        expiry_raw = row["token_expires_at"]
+        try:
+            expiry = datetime.fromisoformat(expiry_raw) if expiry_raw is not None else None
+        except (ValueError, TypeError) as error:
+            raise JobStateError("stored token expiry is invalid") from error
+        if expiry is not None and (expiry.tzinfo is None or expiry.utcoffset() is None):
+            raise JobStateError("stored token expiry lacks a timezone")
         return JobRecord(
             row["job_id"],
             row["worker_id"],
@@ -219,12 +237,36 @@ class JobStore:
             row["state"],
             row["created_at"],
             row["updated_at"],
+            expiry,
         )
+
+    def record_token_expiry(self, job_id: str, expires_at: datetime) -> None:
+        """Store only the worker token deadline before an irreversible webhook POST."""
+        if (
+            not isinstance(expires_at, datetime)
+            or expires_at.tzinfo is None
+            or expires_at.utcoffset() is None
+            or expires_at.astimezone(UTC) - datetime.now(UTC) < TOKEN_MINIMUM
+        ):
+            raise JobStateError("worker token expiry is invalid or too soon")
+        with self._connection:
+            result = self._connection.execute(
+                """UPDATE jobs SET token_expires_at=?, updated_at=?
+                   WHERE job_id=? AND state='lease_held' AND token_expires_at IS NULL""",
+                (expires_at.astimezone(UTC).isoformat(), _now(), _identifier(job_id)),
+            )
+            if result.rowcount != 1:
+                raise JobStateError("worker token expiry cannot be recorded in this state")
 
     def advance(self, job_id: str, state: str) -> None:
         record = self.get(job_id)
         if record is None or state not in NEXT_STATES.get(record.state, set()):
             raise JobStateError("job state transition is not allowed")
+        if state == "dispatching" and (
+            record.token_expires_at is None
+            or record.token_expires_at.astimezone(UTC) - datetime.now(UTC) < MAX_JOB_DURATION
+        ):
+            raise JobStateError("worker token expiry must be durable before dispatch")
         with self._connection:
             result = self._connection.execute(
                 "UPDATE jobs SET state=?, updated_at=? WHERE job_id=? AND state=?",
