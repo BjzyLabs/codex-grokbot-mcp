@@ -16,6 +16,8 @@ python -m codex_grokbot_mcp.server --config /absolute/private/config.toml
 
 The server exposes `grokbot_status(job_id)`, `grokbot_active()`, `grokbot_delegate(...)`, and `grokbot_result(job_id)`. Startup marks interrupted jobs uncertain in the private journal; worker availability is read from the configured Vault KV v2 CAS lease. An uncertain job requires reconciliation even if Vault currently reports an available lease. Vault errors fail the active-worker tool rather than reporting a worker available. See [the status tool contract](docs/mcp-status.md) and [the coordinator contract](docs/mcp-coordinator.md).
 
+For installation and first use in Codex, follow the [local setup guide](docs/quickstart.md). The live dispatch gate in that guide must be satisfied before enabling delegation.
+
 ## Security boundary
 
 - HashiCorp Vault is required for credentials and shared worker leasing. There is one supported backend.
