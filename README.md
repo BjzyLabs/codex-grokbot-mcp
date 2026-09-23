@@ -4,7 +4,17 @@ A local, stdio MCP server for bounded coding delegation from Codex to a Grok Bot
 
 ## Project status
 
-Implementation is in progress. The current public tree contains the project process, publication checks, the local source and patch contract, and a tested Vault lease client, a scoped GitHub/webhook transport, a private local job journal, a bounded coding-packet builder, and a strict multi-worker configuration loader. It does not yet provide a working MCP server. Track bounded work in [Beads](.beads/README.md).
+Implementation is in progress. The current public tree contains the project process, publication checks, the local source and patch contract, a tested Vault lease client, a scoped GitHub/webhook transport, a private local job journal, a bounded coding-packet builder, and a strict multi-worker configuration loader. A read-only stdio MCP server now exposes job status and worker availability. Delegation and patch retrieval are not yet available. Track bounded work in [Beads](.beads/README.md).
+
+## Read-only MCP status
+
+Install this package in a Python 3.12+ virtual environment, then create an owner-only configuration file outside the repository using [`config.example.toml`](config.example.toml). Launch the local stdio server with:
+
+```sh
+python -m codex_grokbot_mcp.server --config /absolute/private/config.toml
+```
+
+The server exposes `grokbot_status(job_id)` and `grokbot_active()`. Startup marks interrupted jobs uncertain in the private journal; worker availability is read from the configured Vault KV v2 CAS lease. An uncertain job requires reconciliation even if Vault currently reports an available lease. Vault errors fail the active-worker tool rather than reporting a worker available. See [the status tool contract](docs/mcp-status.md).
 
 ## Security boundary
 

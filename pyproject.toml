@@ -9,6 +9,7 @@ description = "Bounded Codex to Grok Bot coding delegation over local MCP"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
+dependencies = ["mcp>=2.2,<3"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<9", "ruff>=0.12,<1"]

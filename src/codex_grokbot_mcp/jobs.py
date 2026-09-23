@@ -10,6 +10,7 @@ import stat
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 from codex_grokbot_mcp.control import ARTIFACT_PATTERN, BRANCH_PATTERN, TOKEN_MINIMUM
 from codex_grokbot_mcp.local import ContractError, DelegationContext, Workspace
@@ -239,6 +240,19 @@ class JobStore:
             row["updated_at"],
             expiry,
         )
+
+    def list_open(self) -> tuple[JobRecord, ...]:
+        """Return nonterminal jobs, including uncertain jobs awaiting reconciliation."""
+        rows = self._connection.execute(
+            """SELECT job_id FROM jobs
+               WHERE state IN ('queued', 'lease_held', 'dispatching', 'dispatched',
+                               'artifact_received', 'validated', 'uncertain')
+               ORDER BY created_at, job_id"""
+        ).fetchall()
+        records = tuple(self.get(row["job_id"]) for row in rows)
+        if any(record is None for record in records):
+            raise JobStateError("job list changed during read")
+        return cast(tuple[JobRecord, ...], records)
 
     def record_token_expiry(self, job_id: str, expires_at: datetime) -> None:
         """Store only the worker token deadline before an irreversible webhook POST."""
