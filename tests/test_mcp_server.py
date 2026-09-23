@@ -77,7 +77,12 @@ def test_protocol_status_is_minimal_and_restart_reconciles(tmp_path: Path) -> No
     async def exercise() -> None:
         async with Client(create_server(config, store), raise_exceptions=True) as client:
             tools = {tool.name for tool in (await client.list_tools()).tools}
-            assert tools == {"grokbot_status", "grokbot_active"}
+            assert tools == {
+                "grokbot_status",
+                "grokbot_active",
+                "grokbot_delegate",
+                "grokbot_result",
+            }
             found = (
                 await client.call_tool("grokbot_status", {"job_id": "job-123"})
             ).structured_content
@@ -184,13 +189,20 @@ def test_real_stdio_transport_serves_status(tmp_path: Path) -> None:
             args=["-m", "codex_grokbot_mcp.server", "--config", str(config_file)],
         )
         async with Client(params) as client:
+            names = {tool.name for tool in (await client.list_tools()).tools}
+            assert names == {
+                "grokbot_status",
+                "grokbot_active",
+                "grokbot_delegate",
+                "grokbot_result",
+            }
             result = (
                 await client.call_tool("grokbot_status", {"job_id": "job-123"})
             ).structured_content
             assert result == {
                 "job_id": "job-123",
                 "worker_id": "worker-a",
-                "state": "queued",
+                "state": "uncertain",
                 "updated_at": result["updated_at"],
             }
 

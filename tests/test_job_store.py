@@ -163,13 +163,13 @@ def test_invalid_dispatch_coordinates_are_rejected(tmp_path: Path, context) -> N
     store.close()
 
 
-def test_queued_job_remains_queued_after_restart(tmp_path: Path, context) -> None:
+def test_queued_job_requires_reconciliation_after_restart(tmp_path: Path, context) -> None:
     store = new_store(tmp_path)
     create_job(store, context)
     store.close()
     reopened = JobStore.open(tmp_path / "private" / "jobs.sqlite3")
-    assert reopened.reconcile_restart() == ()
-    assert reopened.get("job-123").state == "queued"
+    assert reopened.reconcile_restart() == ("job-123",)
+    assert reopened.get("job-123").state == "uncertain"
     reopened.close()
 
 
@@ -290,8 +290,8 @@ def test_schema_v1_journal_migrates_without_losing_jobs(
     store = JobStore.open(db)
     assert store.get("job-123").snapshot_digest == context.snapshot_digest
     assert store.get("job-123").token_expires_at is None
-    assert store.reconcile_restart() == (("job-123",) if prior_state == "dispatching" else ())
-    assert store.get("job-123").state == ("uncertain" if prior_state == "dispatching" else "queued")
+    assert store.reconcile_restart() == ("job-123",)
+    assert store.get("job-123").state == "uncertain"
     store.close()
     with sqlite3.connect(db) as check:
         assert check.execute("SELECT version FROM schema_version").fetchone()[0] == 3
