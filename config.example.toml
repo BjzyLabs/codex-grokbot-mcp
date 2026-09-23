@@ -1,0 +1,28 @@
+# Copy outside the repository, replace every example path, and chmod 0600.
+# Store only paths and repository names here; never store secret values.
+version = 1
+vault_address = "https://vault.example.invalid:8200"
+vault_mount = "secret"
+vault_role_id_file = "/absolute/private/location/role_id"
+vault_secret_id_file = "/absolute/private/location/secret_id"
+vault_ca_file = "/absolute/path/to/vault-ca.pem"
+github_ca_file = "/absolute/path/to/system-ca.pem"
+webhook_ca_file = "/absolute/path/to/system-ca.pem"
+job_database = "/absolute/private/location/jobs.sqlite3"
+control_repository = "example-org/private-control"
+
+[workers.coder_a]
+webhook_secret_path = "grokbot/webhooks/coder-a"
+app_secret_path = "grokbot/apps/coder-a"
+lease_prefix = "grokbot/leases"
+lease_worker = "coder-a"
+
+[workers.coder_b]
+webhook_secret_path = "grokbot/webhooks/coder-b"
+app_secret_path = "grokbot/apps/coder-b"
+lease_prefix = "grokbot/leases"
+lease_worker = "coder-b"
+
+[workspaces."/absolute/path/to/project"]
+enabled = false
+workers = ["coder_a"]
