@@ -4,7 +4,7 @@ A local, stdio MCP server for bounded coding delegation from Codex to a Grok Bot
 
 ## Project status
 
-Implementation is in progress. The current public tree contains the project process, publication checks, the local source and patch contract, and a tested Vault lease client. It does not yet provide a working MCP server. Track bounded work in [Beads](.beads/README.md).
+Implementation is in progress. The current public tree contains the project process, publication checks, the local source and patch contract, and a tested Vault lease client, and a scoped GitHub/webhook transport. It does not yet provide a working MCP server. Track bounded work in [Beads](.beads/README.md).
 
 ## Security boundary
 
@@ -14,7 +14,7 @@ Implementation is in progress. The current public tree contains the project proc
 - The worker's patch is untrusted. Declared changed paths must equal actual patch paths, and each actual path must be allowed by `write_paths`.
 - Codex alone applies accepted patches. The worker cannot merge or deploy.
 
-See [the security model](docs/security-model.md), [local contract](docs/local-contract.md), [Vault setup contract](docs/vault-setup.md), and [contribution guide](CONTRIBUTING.md).
+See [the security model](docs/security-model.md), [local contract](docs/local-contract.md), [Vault setup contract](docs/vault-setup.md), [control transport](docs/control-transport.md), [worker guidance](docs/workers.md), and [contribution guide](CONTRIBUTING.md).
 
 ## Public development
 

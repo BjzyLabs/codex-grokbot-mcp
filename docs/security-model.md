@@ -7,3 +7,5 @@ Each workspace must explicitly opt in to delegation. A request declares separate
 A worker lease is acquired with Vault KV v2 compare-and-swap before dispatch. The same lease contract must be enforced by every dispatcher sharing that worker. Uncertain dispatch or timeout does not free a lease until reconciliation proves a terminal outcome. Jobs are capped at 45 minutes. Durable non-secret state supports reconciliation after a stdio process restart.
 
 There are no alternative credential or lease backends in this project. A failed prerequisite stops dependent work; it does not trigger a fallback transport or weaker validation.
+
+Multiple workers may share one provider account's computer. Separate Vault leases and GitHub App tokens bound jobs and control-repository access; they do not provide filesystem or browser-session isolation between Bots. Only configure a Bot for source it is authorized to see.
