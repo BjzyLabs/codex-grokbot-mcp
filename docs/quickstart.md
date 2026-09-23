@@ -31,12 +31,14 @@ record the blocker. Do not redirect a job to another Bot or endpoint.
 
 ## Develop acceptance gate
 
-Test the integration from the `develop` branch before any promotion to
-`main`. First run the local protocol and contract checks. After the installed
-dispatcher lease guard and live prerequisites are verified, run one monitored
-staged canary from `develop` and review its result. Promote `develop` to
-`main` only after that milestone is accepted. A green pull request or local
-test suite alone does not authorize a live job or promotion.
+Test the integration from the `develop` branch. First run the local protocol
+and contract checks. After the installed dispatcher lease guard and live
+prerequisites are verified, run one monitored staged canary from `develop`
+and review its result. Keep the MVP and subsequent feature work on `develop`
+until the operator completes and accepts a full end-to-end test on their
+workstation. Any later promotion to `main` requires a separate release
+decision. A green pull request, local test suite, or staged canary alone does
+not authorize promotion.
 
 ## Install and connect
 
@@ -56,7 +58,9 @@ After the live gate above is satisfied, register the stdio command in Codex
 with absolute paths:
 
 ```sh
-codex mcp add codex-grokbot -- /absolute/path/to/checkout/.venv/bin/python -m codex_grokbot_mcp.server --config /absolute/private/config.toml
+codex mcp add codex-grokbot -- \
+  /absolute/path/to/checkout/.venv/bin/python -m codex_grokbot_mcp.server \
+  --config /absolute/private/config.toml
 codex mcp list
 ```
 

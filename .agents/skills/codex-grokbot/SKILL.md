@@ -16,9 +16,10 @@ canary to have passed. If proof is absent, stop at source-only checks. Never
 substitute a Bot, credential, endpoint, transport, model, or weaker check to
 make a job proceed.
 
-Test and accept the staged integration on `develop` before promoting it to
-`main`. A green pull request does not replace the installed guard or live
-canary gates.
+Test the staged integration on `develop`, then keep the MVP and later feature
+work there until the operator accepts a full end-to-end workstation test.
+Promotion to `main` requires a separate release decision. A green pull request
+does not replace the installed guard or live canary gates.
 
 For a permitted job:
 
