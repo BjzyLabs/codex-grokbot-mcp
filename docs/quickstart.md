@@ -29,6 +29,15 @@ There is no alternate secret backend, transport, or lease mode. If a required
 path, permission, installed guard, or live contract is missing, stop and
 record the blocker. Do not redirect a job to another Bot or endpoint.
 
+## Develop acceptance gate
+
+Test the integration from the `develop` branch before any promotion to
+`main`. First run the local protocol and contract checks. After the installed
+dispatcher lease guard and live prerequisites are verified, run one monitored
+staged canary from `develop` and review its result. Promote `develop` to
+`main` only after that milestone is accepted. A green pull request or local
+test suite alone does not authorize a live job or promotion.
+
 ## Install and connect
 
 From a clean checkout of this repository, create or use its Python 3.12+
