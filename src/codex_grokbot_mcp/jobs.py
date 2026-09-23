@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -16,7 +17,7 @@ from codex_grokbot_mcp.control import ARTIFACT_PATTERN, BRANCH_PATTERN, TOKEN_MI
 from codex_grokbot_mcp.local import ContractError, DelegationContext, Workspace
 from codex_grokbot_mcp.vault import MAX_JOB_DURATION
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 ACTIVE_STATES = ("lease_held", "dispatching", "dispatched", "artifact_received", "validated")
 NEXT_STATES = {
     "queued": {"lease_held", "failed", "conflict"},
@@ -38,6 +39,19 @@ class JobStateError(RuntimeError):
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def artifact_digest(artifact: dict[str, object]) -> str:
+    """Bind a validated artifact to deterministic JSON without retaining its patch."""
+    if not isinstance(artifact, dict):
+        raise JobStateError("artifact is not an object")
+    try:
+        encoded = json.dumps(
+            artifact, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError) as error:
+        raise JobStateError("artifact is not canonical JSON") from error
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _identifier(value: str) -> str:
@@ -102,6 +116,8 @@ class JobRecord:
     created_at: str
     updated_at: str
     token_expires_at: datetime | None
+    artifact_head_sha: str | None
+    artifact_sha256: str | None
 
 
 class JobStore:
@@ -129,9 +145,9 @@ class JobStore:
                 connection.execute(
                     "INSERT INTO schema_version(version) VALUES (?)", (SCHEMA_VERSION,)
                 )
-            elif len(rows) != 1 or rows[0][0] not in (1, SCHEMA_VERSION):
+            elif len(rows) != 1 or rows[0][0] not in (1, 2, SCHEMA_VERSION):
                 raise JobStateError("job store schema version is unsupported")
-            needs_migration = bool(rows and rows[0][0] == 1)
+            old_version = rows[0][0] if rows else SCHEMA_VERSION
             connection.execute(
                 """CREATE TABLE IF NOT EXISTS jobs (
                     job_id TEXT PRIMARY KEY, worker_id TEXT NOT NULL,
@@ -141,15 +157,23 @@ class JobStore:
                     snapshot_digest TEXT NOT NULL,
                     control_branch TEXT NOT NULL, artifact_path TEXT NOT NULL,
                     state TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                    token_expires_at TEXT
+                    token_expires_at TEXT, artifact_head_sha TEXT, artifact_sha256 TEXT
                 )"""
             )
-            if needs_migration:
+            if old_version == 1:
                 connection.execute("ALTER TABLE jobs ADD COLUMN token_expires_at TEXT")
+            if old_version < 3:
+                connection.execute("ALTER TABLE jobs ADD COLUMN artifact_head_sha TEXT")
+                connection.execute("ALTER TABLE jobs ADD COLUMN artifact_sha256 TEXT")
+                connection.execute(
+                    """UPDATE jobs SET state='uncertain', updated_at=?
+                       WHERE state IN ('validated', 'ready')""",
+                    (_now(),),
+                )
                 connection.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
             columns = {row["name"] for row in connection.execute("PRAGMA table_info(jobs)")}
-            if "token_expires_at" not in columns:
-                raise JobStateError("job store expiry column is missing")
+            if not {"token_expires_at", "artifact_head_sha", "artifact_sha256"}.issubset(columns):
+                raise JobStateError("job store identity or expiry columns are missing")
             connection.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS jobs_control_branch ON jobs(control_branch)"
             )
@@ -187,7 +211,10 @@ class JobStore:
         try:
             with self._connection:
                 self._connection.execute(
-                    """INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    """INSERT INTO jobs VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    )""",
                     (
                         job_id,
                         worker_id,
@@ -204,6 +231,8 @@ class JobStore:
                         "queued",
                         now,
                         now,
+                        None,
+                        None,
                         None,
                     ),
                 )
@@ -222,6 +251,17 @@ class JobStore:
             raise JobStateError("stored token expiry is invalid") from error
         if expiry is not None and (expiry.tzinfo is None or expiry.utcoffset() is None):
             raise JobStateError("stored token expiry lacks a timezone")
+        artifact_head_sha = row["artifact_head_sha"]
+        artifact_sha256 = row["artifact_sha256"]
+        if (artifact_head_sha is None) != (artifact_sha256 is None):
+            raise JobStateError("stored artifact identity is incomplete")
+        if artifact_head_sha is not None and (
+            not re.fullmatch(r"[0-9a-f]{40}", artifact_head_sha)
+            or not re.fullmatch(r"[0-9a-f]{64}", artifact_sha256)
+        ):
+            raise JobStateError("stored artifact identity is invalid")
+        if row["state"] in ("validated", "ready") and artifact_head_sha is None:
+            raise JobStateError("stored validated job lacks artifact identity")
         return JobRecord(
             row["job_id"],
             row["worker_id"],
@@ -239,6 +279,8 @@ class JobStore:
             row["created_at"],
             row["updated_at"],
             expiry,
+            artifact_head_sha,
+            artifact_sha256,
         )
 
     def list_open(self) -> tuple[JobRecord, ...]:
@@ -272,6 +314,29 @@ class JobStore:
             if result.rowcount != 1:
                 raise JobStateError("worker token expiry cannot be recorded in this state")
 
+    def record_artifact_identity(self, job_id: str, head_sha: str, artifact_sha256: str) -> None:
+        """Pin one validated artifact's immutable commit and content digest."""
+        if (
+            not isinstance(head_sha, str)
+            or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None
+            or not isinstance(artifact_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", artifact_sha256) is None
+        ):
+            raise JobStateError("artifact identity is invalid")
+        record = self.get(job_id)
+        if record is None or record.state != "artifact_received":
+            raise JobStateError("artifact identity cannot be recorded in this state")
+        if record.artifact_head_sha is not None:
+            raise JobStateError("artifact identity was already recorded")
+        with self._connection:
+            result = self._connection.execute(
+                """UPDATE jobs SET artifact_head_sha=?, artifact_sha256=?, updated_at=?
+                   WHERE job_id=? AND state='artifact_received' AND artifact_head_sha IS NULL""",
+                (head_sha, artifact_sha256, _now(), job_id),
+            )
+            if result.rowcount != 1:
+                raise JobStateError("artifact identity was already recorded or state changed")
+
     def advance(self, job_id: str, state: str) -> None:
         record = self.get(job_id)
         if record is None or state not in NEXT_STATES.get(record.state, set()):
@@ -281,6 +346,8 @@ class JobStore:
             or record.token_expires_at.astimezone(UTC) - datetime.now(UTC) < MAX_JOB_DURATION
         ):
             raise JobStateError("worker token expiry must be durable before dispatch")
+        if state in ("validated", "ready") and record.artifact_head_sha is None:
+            raise JobStateError("artifact identity must be durable before validation")
         with self._connection:
             result = self._connection.execute(
                 "UPDATE jobs SET state=?, updated_at=? WHERE job_id=? AND state=?",

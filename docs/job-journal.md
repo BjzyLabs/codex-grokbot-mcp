@@ -30,3 +30,5 @@ selected snapshot and compares repository, HEAD, branch, and digest. Drift
 moves the job to `conflict` and keeps the saved evidence. A valid snapshot
 check does not itself authorize dispatch: per-workspace opt-in must also be
 checked from current configuration by the MCP layer.
+
+Schema v3 records the immutable control-repository head commit and a SHA-256 digest of the validated artifact's canonical JSON before a job may become `validated` or `ready`. Canonical JSON sorts object keys, uses compact separators and UTF-8, and rejects non-finite numbers. The patch text is never stored in the journal. Result retrieval must read from that pinned commit and compare the digest again before returning a patch. A recorded identity cannot be replaced. Schema-v1 and schema-v2 journals migrate in place; a legacy `validated` or `ready` job without this identity becomes `uncertain` and requires reconciliation.
