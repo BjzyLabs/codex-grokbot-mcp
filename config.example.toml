@@ -10,12 +10,16 @@ github_ca_file = "/absolute/path/to/system-ca.pem"
 webhook_ca_file = "/absolute/path/to/system-ca.pem"
 job_database = "/absolute/private/location/jobs.sqlite3"
 control_repository = "example-org/private-control"
+# Omit both inbox keys to keep coding on the control-repository draft PR.
+# result_inbox_base_url = "https://inbox.example.invalid"
+# result_inbox_secret_path = "grokbot/inbox/requestor"
 
 [workers.coder_a]
 webhook_secret_path = "grokbot/webhooks/coder-a"
 app_secret_path = "grokbot/apps/coder-a"
 lease_prefix = "grokbot/leases"
 lease_worker = "coder-a"
+# job_types = ["coding"]
 
 [workers.coder_b]
 webhook_secret_path = "grokbot/webhooks/coder-b"

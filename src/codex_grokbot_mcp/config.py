@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .control import REPO_PATTERN
+from .deliver import PacketError, canonical_inbox_origin
 from .vault import VaultClient, VaultError
 
 TOP_KEYS = {
@@ -27,8 +28,11 @@ TOP_KEYS = {
     "workers",
     "workspaces",
 }
+OPTIONAL_TOP_KEYS = {"result_inbox_base_url", "result_inbox_secret_path"}
 WORKER_KEYS = {"webhook_secret_path", "app_secret_path", "lease_prefix", "lease_worker"}
+OPTIONAL_WORKER_KEYS = {"job_types"}
 WORKSPACE_KEYS = {"enabled", "workers"}
+JOB_TYPES = {"coding", "x_query"}
 COMPONENT = re.compile(r"[A-Za-z0-9_.-]+\Z")
 NESTED_PATH = re.compile(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\Z")
 
@@ -37,8 +41,15 @@ class ConfigError(ValueError):
     """Configuration is missing, unsafe, or grants ambiguous authority."""
 
 
-def _keys(value: Any, allowed: set[str], *, label: str) -> dict:
-    if not isinstance(value, dict) or set(value) != allowed:
+def _keys(
+    value: Any,
+    allowed: set[str],
+    *,
+    label: str,
+    optional: set[str] | None = None,
+) -> dict:
+    optional = set() if optional is None else optional
+    if not isinstance(value, dict) or not allowed <= set(value) <= allowed | optional:
         raise ConfigError(f"{label} has missing or unknown fields")
     return value
 
@@ -82,6 +93,31 @@ def _ca_file(value: Any, *, label: str) -> Path:
     return path
 
 
+def _job_types(value: Any) -> frozenset[str]:
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(not isinstance(item, str) or item not in JOB_TYPES for item in value)
+        or len(value) != len(set(value))
+    ):
+        raise ConfigError("worker job types are invalid")
+    return frozenset(value)
+
+
+def _inbox(source: dict) -> tuple[str | None, str | None]:
+    url = source.get("result_inbox_base_url")
+    secret = source.get("result_inbox_secret_path")
+    if url is None and secret is None:
+        return None, None
+    if not isinstance(url, str) or not isinstance(secret, str):
+        raise ConfigError("result inbox configuration is incomplete")
+    try:
+        origin = canonical_inbox_origin(url)
+    except PacketError as error:
+        raise ConfigError("result inbox origin is invalid") from error
+    return origin, _component(secret, nested=True)
+
+
 @dataclass(frozen=True)
 class WorkerConfig:
     worker_id: str
@@ -89,6 +125,7 @@ class WorkerConfig:
     app_secret_path: str
     lease_prefix: str
     lease_worker: str
+    job_types: frozenset[str] = frozenset({"coding"})
 
 
 @dataclass(frozen=True)
@@ -110,6 +147,8 @@ class Config:
     control_repository: str
     workers: dict[str, WorkerConfig]
     workspaces: dict[Path, WorkspaceRule]
+    result_inbox_base_url: str | None = None
+    result_inbox_secret_path: str | None = None
 
     @classmethod
     def load(cls, path: Path) -> Config:
@@ -119,7 +158,7 @@ class Config:
                 source = tomllib.load(handle)
         except (OSError, tomllib.TOMLDecodeError) as error:
             raise ConfigError("configuration TOML cannot be read") from error
-        _keys(source, TOP_KEYS, label="configuration")
+        _keys(source, TOP_KEYS, label="configuration", optional=OPTIONAL_TOP_KEYS)
         if type(source["version"]) is not int or source["version"] != 1:
             raise ConfigError("configuration version is unsupported")
         mount = _component(source["vault_mount"])
@@ -147,13 +186,14 @@ class Config:
         lease_keys: set[tuple[str, str]] = set()
         for worker_id, item in workers_data.items():
             _component(worker_id)
-            _keys(item, WORKER_KEYS, label="worker")
+            _keys(item, WORKER_KEYS, label="worker", optional=OPTIONAL_WORKER_KEYS)
             worker = WorkerConfig(
                 worker_id,
                 _component(item["webhook_secret_path"], nested=True),
                 _component(item["app_secret_path"], nested=True),
                 _component(item["lease_prefix"], nested=True),
                 _component(item["lease_worker"]),
+                _job_types(item.get("job_types", ["coding"])),
             )
             lease_key = (worker.lease_prefix, worker.lease_worker)
             if lease_key in lease_keys:
@@ -178,6 +218,7 @@ class Config:
             if len(allowed) != len(set(allowed)) or root in workspaces:
                 raise ConfigError("workspace worker grants are duplicated")
             workspaces[root] = WorkspaceRule(enabled, frozenset(allowed))
+        inbox_url, inbox_secret = _inbox(source)
         return cls(
             client.address,
             mount,
@@ -190,6 +231,8 @@ class Config:
             repository,
             workers,
             workspaces,
+            inbox_url,
+            inbox_secret,
         )
 
     def vault_client(self) -> VaultClient:
@@ -208,4 +251,10 @@ class Config:
         rule = self.workspaces.get(Path(root).resolve())
         if rule is None or not rule.enabled or worker_id not in rule.workers:
             raise ConfigError("workspace opt-in is required for this worker")
+        return worker
+
+    def require_job_type(self, worker_id: str, job_type: str) -> WorkerConfig:
+        worker = self.workers.get(worker_id)
+        if worker is None or job_type not in worker.job_types:
+            raise ConfigError("worker cannot accept this job type")
         return worker

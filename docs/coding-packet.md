@@ -25,3 +25,7 @@ characters. The private job journal enforces unique branch and artifact paths,
 so a prefix collision fails before dispatch. The v2 webhook and artifact
 behavior still require a staged live canary after both dispatchers run the
 shared Vault lease guard. Local packet tests do not establish that live result.
+
+v3 keeps this coding route when `deliver` is `github_pr`. Read-only `x_query`
+jobs use a callback instead of a control-repository artifact. See
+[result delivery](result-delivery.md).

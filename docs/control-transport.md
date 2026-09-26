@@ -16,7 +16,9 @@ job manager must reconcile it before retrying or freeing the worker lease.
 There is no fallback endpoint. The worker receives only the control-repository
 token, never the App key, Vault credentials, or target-repository authority.
 
-The worker returns an open draft PR in the control repository. The transport
+Coding jobs still return an open draft PR in the control repository. An
+`x_query` callback does not use this transport. See
+[result delivery](result-delivery.md). The coding transport
 checks the exact branch and repository, then reads the artifact from the PR's
 immutable head commit rather than a mutable branch name. The artifact remains
 untrusted until the local path and patch validator checks its job identity,
