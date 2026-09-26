@@ -9,7 +9,7 @@ import re
 import sqlite3
 import stat
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
@@ -17,7 +17,7 @@ from codex_grokbot_mcp.control import ARTIFACT_PATTERN, BRANCH_PATTERN, TOKEN_MI
 from codex_grokbot_mcp.local import ContractError, DelegationContext, Workspace
 from codex_grokbot_mcp.vault import MAX_JOB_DURATION
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 ACTIVE_STATES = (
     "queued",
     "lease_held",
@@ -30,7 +30,7 @@ NEXT_STATES = {
     "queued": {"lease_held", "failed", "uncertain", "conflict"},
     "lease_held": {"dispatching", "failed", "uncertain", "conflict"},
     "dispatching": {"dispatched", "uncertain", "conflict"},
-    "dispatched": {"artifact_received", "uncertain", "conflict"},
+    "dispatched": {"artifact_received", "uncertain", "conflict", "failed", "ready"},
     "artifact_received": {"validated", "uncertain", "conflict"},
     "validated": {"ready", "uncertain", "conflict"},
     "ready": {"conflict"},
@@ -46,6 +46,12 @@ class JobStateError(RuntimeError):
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _add_column(connection: sqlite3.Connection, name: str, declaration: str) -> None:
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(jobs)")}
+    if name not in columns:
+        connection.execute(f"ALTER TABLE jobs ADD COLUMN {name} {declaration}")
 
 
 def artifact_digest(artifact: dict[str, object]) -> str:
@@ -125,6 +131,12 @@ class JobRecord:
     token_expires_at: datetime | None
     artifact_head_sha: str | None
     artifact_sha256: str | None
+    packet_schema: str = "v2"
+    job_type: str = "coding"
+    deliver: str = "github_pr"
+    callback_expected: bool = False
+    inbox_body_sha256: str | None = None
+    terminal_reason: str | None = None
 
 
 class JobStore:
@@ -152,7 +164,7 @@ class JobStore:
                 connection.execute(
                     "INSERT INTO schema_version(version) VALUES (?)", (SCHEMA_VERSION,)
                 )
-            elif len(rows) != 1 or rows[0][0] not in (1, 2, SCHEMA_VERSION):
+            elif len(rows) != 1 or rows[0][0] not in (1, 2, 3, SCHEMA_VERSION):
                 raise JobStateError("job store schema version is unsupported")
             old_version = rows[0][0] if rows else SCHEMA_VERSION
             connection.execute(
@@ -164,22 +176,43 @@ class JobStore:
                     snapshot_digest TEXT NOT NULL,
                     control_branch TEXT NOT NULL, artifact_path TEXT NOT NULL,
                     state TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                    token_expires_at TEXT, artifact_head_sha TEXT, artifact_sha256 TEXT
+                    token_expires_at TEXT, artifact_head_sha TEXT, artifact_sha256 TEXT,
+                    packet_schema TEXT NOT NULL DEFAULT 'v2',
+                    job_type TEXT NOT NULL DEFAULT 'coding',
+                    deliver TEXT NOT NULL DEFAULT 'github_pr',
+                    callback_expected INTEGER NOT NULL DEFAULT 0,
+                    inbox_body_sha256 TEXT, terminal_reason TEXT
                 )"""
             )
             if old_version == 1:
-                connection.execute("ALTER TABLE jobs ADD COLUMN token_expires_at TEXT")
+                _add_column(connection, "token_expires_at", "TEXT")
             if old_version < 3:
-                connection.execute("ALTER TABLE jobs ADD COLUMN artifact_head_sha TEXT")
-                connection.execute("ALTER TABLE jobs ADD COLUMN artifact_sha256 TEXT")
+                _add_column(connection, "artifact_head_sha", "TEXT")
+                _add_column(connection, "artifact_sha256", "TEXT")
                 connection.execute(
                     """UPDATE jobs SET state='uncertain', updated_at=?
                        WHERE state IN ('validated', 'ready')""",
                     (_now(),),
                 )
+            if old_version < SCHEMA_VERSION:
+                _add_column(connection, "packet_schema", "TEXT NOT NULL DEFAULT 'v2'")
+                _add_column(connection, "job_type", "TEXT NOT NULL DEFAULT 'coding'")
+                _add_column(connection, "deliver", "TEXT NOT NULL DEFAULT 'github_pr'")
+                _add_column(connection, "callback_expected", "INTEGER NOT NULL DEFAULT 0")
+                _add_column(connection, "inbox_body_sha256", "TEXT")
+                _add_column(connection, "terminal_reason", "TEXT")
                 connection.execute("UPDATE schema_version SET version=?", (SCHEMA_VERSION,))
             columns = {row["name"] for row in connection.execute("PRAGMA table_info(jobs)")}
-            if not {"token_expires_at", "artifact_head_sha", "artifact_sha256"}.issubset(columns):
+            required = {
+                "token_expires_at",
+                "artifact_head_sha",
+                "artifact_sha256",
+                "packet_schema",
+                "job_type",
+                "deliver",
+                "callback_expected",
+            }
+            if not required.issubset(columns):
                 raise JobStateError("job store identity or expiry columns are missing")
             connection.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS jobs_control_branch ON jobs(control_branch)"
@@ -218,7 +251,12 @@ class JobStore:
         try:
             with self._connection:
                 self._connection.execute(
-                    """INSERT INTO jobs VALUES (
+                    """INSERT INTO jobs (
+                        job_id, worker_id, lease_owner, root, target_repo, head, branch,
+                        read_paths, write_paths, snapshot_digest, control_branch, artifact_path,
+                        state, created_at, updated_at, token_expires_at, artifact_head_sha,
+                        artifact_sha256
+                    ) VALUES (
                         ?, ?, ?, ?, ?, ?, ?, ?, ?,
                         ?, ?, ?, ?, ?, ?, ?, ?, ?
                     )""",
@@ -267,8 +305,15 @@ class JobStore:
             or not re.fullmatch(r"[0-9a-f]{64}", artifact_sha256)
         ):
             raise JobStateError("stored artifact identity is invalid")
+        packet_schema = row["packet_schema"]
+        job_type = row["job_type"]
+        deliver = row["deliver"]
+        callback_expected = bool(row["callback_expected"])
+        inbox_body_sha256 = row["inbox_body_sha256"]
+        terminal_reason = row["terminal_reason"]
         if row["state"] in ("validated", "ready") and artifact_head_sha is None:
-            raise JobStateError("stored validated job lacks artifact identity")
+            if not (job_type == "x_query" and inbox_body_sha256 and row["state"] == "ready"):
+                raise JobStateError("stored validated job lacks artifact identity")
         return JobRecord(
             row["job_id"],
             row["worker_id"],
@@ -288,6 +333,12 @@ class JobStore:
             expiry,
             artifact_head_sha,
             artifact_sha256,
+            packet_schema,
+            job_type,
+            deliver,
+            callback_expected,
+            inbox_body_sha256,
+            terminal_reason,
         )
 
     def list_open(self) -> tuple[JobRecord, ...]:
@@ -302,6 +353,75 @@ class JobStore:
         if any(record is None for record in records):
             raise JobStateError("job list changed during read")
         return cast(tuple[JobRecord, ...], records)
+
+    def create_callback_job(
+        self,
+        job_id: str,
+        worker_id: str,
+        *,
+        lease_owner: str,
+        root: Path,
+        deadline: datetime,
+    ) -> None:
+        """Journal one callback job without control-repository coordinates."""
+        _identifier(job_id)
+        _identifier(worker_id)
+        _identifier(lease_owner)
+        if deadline.tzinfo is None or deadline <= datetime.now(UTC):
+            raise JobStateError("callback deadline is invalid")
+        now = _now()
+        try:
+            with self._connection:
+                self._connection.execute(
+                    """INSERT INTO jobs (
+                        job_id, worker_id, lease_owner, root, target_repo, head, branch,
+                        read_paths, write_paths, snapshot_digest, control_branch, artifact_path,
+                        state, created_at, updated_at, token_expires_at,
+                        packet_schema, job_type, deliver, callback_expected
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    )""",
+                    (
+                        job_id,
+                        worker_id,
+                        lease_owner,
+                        str(root),
+                        "local/none",
+                        "0" * 40,
+                        "none",
+                        "[]",
+                        "[]",
+                        "0" * 64,
+                        f"callback/{job_id}",
+                        f"callbacks/{job_id}.json",
+                        "queued",
+                        now,
+                        now,
+                        deadline.astimezone(UTC).isoformat(),
+                        "v3",
+                        "x_query",
+                        "callback",
+                        1,
+                    ),
+                )
+        except sqlite3.IntegrityError as error:
+            raise JobStateError("job identity or artifact coordinates already exist") from error
+
+    def record_callback_result(self, job_id: str, digest: str, reason: str) -> None:
+        """Pin the callback body digest before a terminal callback transition."""
+        if not re.fullmatch(r"[0-9a-f]{64}", digest) or reason not in ("ok", "error", "blocked"):
+            raise JobStateError("callback result identity is invalid")
+        record = self.get(job_id)
+        if record is None or record.state != "dispatched" or record.inbox_body_sha256 is not None:
+            raise JobStateError("callback result cannot be recorded in this state")
+        with self._connection:
+            result = self._connection.execute(
+                """UPDATE jobs SET inbox_body_sha256=?, terminal_reason=?, updated_at=?
+                   WHERE job_id=? AND state='dispatched' AND inbox_body_sha256 IS NULL""",
+                (digest, reason, _now(), job_id),
+            )
+            if result.rowcount != 1:
+                raise JobStateError("callback result was already recorded or state changed")
 
     def record_token_expiry(self, job_id: str, expires_at: datetime) -> None:
         """Store only the worker token deadline before an irreversible webhook POST."""
@@ -348,13 +468,20 @@ class JobStore:
         record = self.get(job_id)
         if record is None or state not in NEXT_STATES.get(record.state, set()):
             raise JobStateError("job state transition is not allowed")
-        if state == "dispatching" and (
-            record.token_expires_at is None
-            or record.token_expires_at.astimezone(UTC) - datetime.now(UTC) < MAX_JOB_DURATION
-        ):
-            raise JobStateError("worker token expiry must be durable before dispatch")
+        if state == "dispatching":
+            if record.token_expires_at is None:
+                raise JobStateError("worker token expiry must be durable before dispatch")
+            remaining = record.token_expires_at.astimezone(UTC) - datetime.now(UTC)
+            if record.job_type == "x_query":
+                if remaining <= timedelta(0):
+                    raise JobStateError("worker token expiry must be durable before dispatch")
+            elif remaining < MAX_JOB_DURATION:
+                raise JobStateError("worker token expiry must be durable before dispatch")
+        if state == "ready" and record.state == "dispatched" and record.job_type != "x_query":
+            raise JobStateError("coding result still requires the pinned artifact")
         if state in ("validated", "ready") and record.artifact_head_sha is None:
-            raise JobStateError("artifact identity must be durable before validation")
+            if not (record.job_type == "x_query" and record.inbox_body_sha256 and state == "ready"):
+                raise JobStateError("artifact identity must be durable before validation")
         with self._connection:
             result = self._connection.execute(
                 "UPDATE jobs SET state=?, updated_at=? WHERE job_id=? AND state=?",

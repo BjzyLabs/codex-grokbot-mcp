@@ -93,6 +93,7 @@ def create_server(config: Config, store: JobStore) -> MCPServer:
         write_paths: list[str],
         acceptance_checks: list[str],
         effort_hint: str,
+        job_type: str = "coding",
     ) -> dict[str, str]:
         try:
             return await coordinator.delegate(
@@ -103,6 +104,7 @@ def create_server(config: Config, store: JobStore) -> MCPServer:
                 write_paths=write_paths,
                 acceptance_checks=acceptance_checks,
                 effort_hint=effort_hint,
+                job_type=job_type,
             )
         except CoordinatorError as error:
             raise ToolError(str(error)) from error

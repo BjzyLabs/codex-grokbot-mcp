@@ -294,7 +294,7 @@ def test_schema_v1_journal_migrates_without_losing_jobs(
     assert store.get("job-123").state == "uncertain"
     store.close()
     with sqlite3.connect(db) as check:
-        assert check.execute("SELECT version FROM schema_version").fetchone()[0] == 3
+        assert check.execute("SELECT version FROM schema_version").fetchone()[0] == 4
 
 
 def test_validated_artifact_identity_is_required_and_survives_restart(
@@ -399,7 +399,7 @@ def test_schema_v2_journal_migrates_without_losing_dispatch_evidence(
     assert record.artifact_sha256 is None
     store.close()
     with sqlite3.connect(db) as check:
-        assert check.execute("SELECT version FROM schema_version").fetchone()[0] == 3
+        assert check.execute("SELECT version FROM schema_version").fetchone()[0] == 4
 
 
 def test_artifact_digest_is_canonical_and_rejects_non_json_values() -> None:

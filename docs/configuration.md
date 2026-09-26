@@ -23,3 +23,7 @@ with files and app logins. Separate lease keys do not isolate those resources.
 Only configure a Bot for source it is authorized to see; use distinct accounts
 when the Bots need separate computer and credential boundaries. The config has
 no model selector because [Cursor manages Grok Bot model selection](https://cursor.com/docs/grok-bot/settings).
+
+Optional `result_inbox_base_url` and `result_inbox_secret_path` enable v3
+callbacks. Omit both to keep coding on the control-repository path. A worker
+may set `job_types` to `coding`, `x_query`, or both. The default is coding only.
