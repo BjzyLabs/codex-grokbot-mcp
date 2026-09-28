@@ -106,6 +106,21 @@ def test_x_query_rejects_control_repo_authority(forbidden) -> None:
         )
 
 
+def test_v3_coding_envelope_requires_explicit_v2_artifact_schema() -> None:
+    packet = coding_packet(status_callback={"origin": ORIGIN, "token": TOKEN})
+    instructions = "\n".join(packet["instructions"])
+
+    assert packet["schema_version"] == "v3"
+    assert packet["context"]["status_callback_url"] == callback_url(ORIGIN, JOB_ID, "status")
+    assert "MUST be exactly 'v2' (never 'v1')" in instructions
+    assert "job_type MUST be exactly 'coding'" in instructions
+    assert (
+        "Copy job_id and context.target_repo, base_sha, workspace_head, and "
+        "snapshot_digest exactly into the corresponding artifact fields."
+    ) in instructions
+    assert "report a blocker; do not submit a v1 or incomplete artifact" in instructions
+
+
 def test_coding_defaults_to_github_pr_and_rejects_callback() -> None:
     packet = coding_packet()
     assert packet["deliver"] == "github_pr"

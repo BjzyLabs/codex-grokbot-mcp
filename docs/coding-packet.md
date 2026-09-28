@@ -7,6 +7,34 @@ The GitHub token is scoped to the private control repository by the transport;
 it never grants access to the target repository. The sender key stays in the
 HTTPS authorization header and is not part of the packet.
 
+## Artifact version
+
+Request-envelope and artifact versions are independent. The v3 delivery
+envelope keeps the coding artifact at schema version `v2`; every live coding
+artifact must set `schema_version` to `v2` and `job_type` to `coding`. The live
+coordinator rejects a v1 artifact. If the worker cannot provide the v2 fields,
+it must report a blocker instead of downgrading the artifact.
+
+The artifact must echo `job_id`, `target_repo`, `base_sha`, `workspace_head`,
+and `snapshot_digest` from the request. It also contains the declared paths,
+summary, unified diff, and completion timestamp:
+
+```json
+{
+  "schema_version": "v2",
+  "job_type": "coding",
+  "job_id": "<job_id>",
+  "target_repo": "<context.target_repo>",
+  "base_sha": "<context.base_sha>",
+  "workspace_head": "<context.workspace_head>",
+  "snapshot_digest": "<context.snapshot_digest>",
+  "declared_changed_paths": ["<path>"],
+  "summary": "<summary>",
+  "patch": "<unified diff>",
+  "completed_at": "<UTC timestamp>"
+}
+```
+
 The v2 fields bind the exact Git HEAD, snapshot digest, separate read and write
 paths, and only the selected source snapshots. The packet includes no local
 workspace path. The worker is instructed to return one patch artifact on the
