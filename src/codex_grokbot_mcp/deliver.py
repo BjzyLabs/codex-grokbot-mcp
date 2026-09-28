@@ -223,10 +223,9 @@ def _strings(value: Any) -> list[str]:
 
 def _reject_answer_strings(texts: list[str], label: str) -> None:
     for text in texts:
-        if (
-            any(ord(character) < 32 and not character.isspace() for character in text)
-            or _CREDENTIAL_RE.search(text)
-        ):
+        if any(
+            ord(character) < 32 and not character.isspace() for character in text
+        ) or _CREDENTIAL_RE.search(text):
             raise PacketError(f"{label} is unsafe")
         if _X_WRITE_CLAIM_RE.search(text):
             raise PacketError(f"{label} claims a write action")
