@@ -185,6 +185,38 @@ def test_unsafe_answers_fail_closed(change) -> None:
         validate_x_query_result(JOB_ID, ok_body(**change), now=now)
 
 
+def test_multiline_plain_text_answer_is_accepted() -> None:
+    now = datetime(2026, 9, 26, 1, tzinfo=UTC)
+    answer = "Highlights:\n\n- First point\n- Second point"
+
+    result = validate_x_query_result(JOB_ID, ok_body(answer=answer), now=now)
+
+    assert result["answer"] == answer
+
+
+def test_multiline_structured_answer_is_accepted() -> None:
+    now = datetime(2026, 9, 26, 1, tzinfo=UTC)
+    answer = {"top_themes": [{"theme": "First line\ncontinued on the next line"}]}
+
+    result = validate_x_query_result(JOB_ID, ok_body(answer=answer), now=now)
+
+    assert result["answer"] == answer
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "safe prefix\x00 unsafe suffix",
+        {"top_themes": [{"theme": "safe prefix\x00 unsafe suffix"}]},
+    ],
+)
+def test_null_control_character_in_answer_fails_closed(answer) -> None:
+    now = datetime(2026, 9, 26, 1, tzinfo=UTC)
+
+    with pytest.raises(PacketError):
+        validate_x_query_result(JOB_ID, ok_body(answer=answer), now=now)
+
+
 def test_status_ping_rejects_patches_and_foreign_pull_requests() -> None:
     body = {
         "schema_version": "v3",

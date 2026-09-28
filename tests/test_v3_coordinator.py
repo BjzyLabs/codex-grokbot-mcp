@@ -104,7 +104,7 @@ def test_callback_answer_becomes_ready_without_a_pull_request(
         "job_type": "x_query",
         "job_id": "",
         "query": "What is being discussed?",
-        "answer": {"top_themes": [{"theme": "Example"}]},
+        "answer": "Topics:\n\n- First point\n- Second point",
         "summary": "One line.",
         "sources": [],
         "read_only_attestation": True,
@@ -136,6 +136,7 @@ def test_callback_answer_becomes_ready_without_a_pull_request(
         assert await settled(store, submitted["job_id"]) == "ready"
         result = await coordinator.result(submitted["job_id"])
         assert result["summary"] == "One line."
+        assert result["answer"] == "Topics:\n\n- First point\n- Second point"
 
     asyncio.run(exercise())
     assert "mint" not in fake.events
