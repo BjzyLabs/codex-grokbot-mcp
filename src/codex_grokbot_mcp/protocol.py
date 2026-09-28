@@ -140,10 +140,19 @@ def build_coding_packet(
                 "transports, hosts, models, or weaker checks."
             ),
             (
-                f"Write one v2 coding patch artifact to '{artifact_path}' with "
-                "schema_version, job_type, job_id, target_repo, base_sha, "
-                "workspace_head, snapshot_digest, declared_changed_paths, "
-                "summary, patch, and completed_at."
+                f"Write one coding patch artifact to '{artifact_path}'. "
+                "Request-envelope and artifact versions are independent: "
+                "the artifact's schema_version MUST be exactly 'v2' "
+                "(never 'v1') and its job_type MUST be exactly 'coding'. "
+                "Include job_id, target_repo, base_sha, workspace_head, "
+                "snapshot_digest, declared_changed_paths, summary, patch, "
+                "and completed_at."
+            ),
+            (
+                "Copy job_id and context.target_repo, base_sha, workspace_head, "
+                "and snapshot_digest exactly into the corresponding artifact "
+                "fields. If any required v2 field is unavailable, report a "
+                "blocker; do not submit a v1 or incomplete artifact."
             ),
             (
                 f"Commit the artifact on '{control_branch}' in the control "
