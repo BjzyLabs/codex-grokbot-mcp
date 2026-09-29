@@ -31,7 +31,7 @@ ACTIVE_STATES = (
 NEXT_STATES = {
     "queued": {"lease_held", "failed", "uncertain", "conflict"},
     "lease_held": {"dispatching", "failed", "uncertain", "conflict"},
-    "dispatching": {"dispatched", "uncertain", "conflict"},
+    "dispatching": {"dispatched", "failed", "uncertain", "conflict"},
     "dispatched": {"artifact_received", "uncertain", "conflict", "failed", "ready"},
     "artifact_received": {"validated", "uncertain", "conflict"},
     "validated": {"ready", "uncertain", "conflict"},

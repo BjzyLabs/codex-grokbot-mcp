@@ -44,3 +44,15 @@ webhook or release the lease based on journal state alone. Compare the saved
 job ID and worker with the exact live Vault lease and control branch first.
 Invalid worker output or changed source becomes `conflict`. Neither state
 is silently retried or substituted with another worker.
+
+X-query and worker diagnostics both target the configured Chief of Staff and
+serialize on that account's shared Vault KV v2 CAS lease. The lease path is
+`GrokBot/Leases/<lease_worker>` under the configured Vault mount, and the v1
+lease record's `worker` is the exact `<lease_worker>` basename. Configure the
+same key in every dispatcher that can call this CoS. MCP acquires it before
+callback registration and webhook dispatch, renews it while waiting when its
+heartbeat approaches expiry, and releases only after a validated terminal
+callback or a failure proven to precede webhook dispatch. An ambiguous lease,
+webhook, callback, invalid callback, interrupted flow, or unverified release
+retains the lease for owner reconciliation. These CoS flows never acquire or
+release the devCoder lease.

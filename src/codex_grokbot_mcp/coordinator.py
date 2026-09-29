@@ -205,6 +205,22 @@ class Coordinator:
         if record is None:
             raise JobStateError("diagnostic journal record disappeared")
         vault = self.config.vault_client()
+        lease_store = VaultLeaseStore(vault, chief.lease_prefix)
+        try:
+            lease = await asyncio.to_thread(
+                lease_store.acquire,
+                chief.lease_worker,
+                owner=LEASE_OWNER,
+                job_id=diagnostic_id,
+            )
+        except WorkerBusy:
+            self.store.transition_diagnostic(diagnostic_id, "delivery_failed")
+            return
+        except VaultError:
+            # A lost CAS response can mean that this lease is already active.
+            # Keep it for reconciliation instead of compensating an ambiguous claim.
+            self.store.transition_diagnostic(diagnostic_id, "uncertain")
+            return
         callback_token = secrets.token_urlsafe(32)
         deadline = datetime.now(UTC) + timedelta(
             seconds=DIAGNOSTIC_MAX_WAIT_SECONDS + DIAGNOSTIC_CALLBACK_GRACE_SECONDS
@@ -231,18 +247,32 @@ class Coordinator:
             )
             self.store.transition_diagnostic(diagnostic_id, "dispatching")
         except (VaultError, ControlError, InboxError, PacketError, JobStateError):
-            self.store.transition_diagnostic(diagnostic_id, "delivery_failed")
+            await self._fail_diagnostic_before_post(diagnostic_id, chief, lease_store)
             return
         try:
             await asyncio.to_thread(webhook.dispatch, packet)
-        except (WebhookUncertain, ControlError):
+        except WebhookUncertain:
             self.store.transition_diagnostic(diagnostic_id, "uncertain")
+            return
+        except ControlError:
+            await self._fail_diagnostic_before_post(diagnostic_id, chief, lease_store)
             return
         self.store.transition_diagnostic(diagnostic_id, "dispatched")
         while datetime.now(UTC) < deadline:
+            now = datetime.now(UTC)
+            if lease.deadline_at is None or now >= lease.deadline_at:
+                self.store.transition_diagnostic(diagnostic_id, "uncertain")
+                return
             try:
+                if lease.expires_at is None or now >= lease.expires_at - LEASE_RENEW_MARGIN:
+                    lease = await asyncio.to_thread(
+                        lease_store.renew,
+                        chief.lease_worker,
+                        owner=LEASE_OWNER,
+                        job_id=diagnostic_id,
+                    )
                 payload = await asyncio.to_thread(inbox.fetch, diagnostic_id, "result")
-            except InboxError:
+            except (InboxError, VaultError):
                 self.store.transition_diagnostic(diagnostic_id, "uncertain")
                 return
             if payload and payload.get("stored"):
@@ -259,32 +289,63 @@ class Coordinator:
                 except (PacketError, TypeError):
                     self.store.transition_diagnostic(diagnostic_id, "uncertain")
                     return
+                digest = payload.get("body_sha256")
+                if (
+                    not isinstance(digest, str)
+                    or len(digest) != 64
+                    or any(character not in "0123456789abcdef" for character in digest)
+                ):
+                    self.store.transition_diagnostic(diagnostic_id, "uncertain")
+                    return
                 status = validated["status"]
-                if status == "replied":
-                    self.store.transition_diagnostic(
-                        diagnostic_id,
-                        "replied",
-                        digest=payload.get("body_sha256"),
-                        reply=validated["reply"],
-                        completed_at=validated["completed_at"],
+                try:
+                    await asyncio.to_thread(
+                        lease_store.release,
+                        chief.lease_worker,
+                        owner=LEASE_OWNER,
+                        job_id=diagnostic_id,
                     )
-                elif status == "no_reply":
-                    self.store.transition_diagnostic(
-                        diagnostic_id,
-                        "no_reply",
-                        digest=payload.get("body_sha256"),
-                        completed_at=validated["completed_at"],
-                    )
-                else:
-                    self.store.transition_diagnostic(
-                        diagnostic_id,
-                        "delivery_failed",
-                        digest=payload.get("body_sha256"),
-                        completed_at=validated["completed_at"],
-                    )
+                except VaultError:
+                    self.store.transition_diagnostic(diagnostic_id, "uncertain")
+                    return
+                terminal_state = {
+                    "replied": "replied",
+                    "no_reply": "no_reply",
+                    "delivery_failed": "delivery_failed",
+                }[status]
+                self.store.transition_diagnostic(
+                    diagnostic_id,
+                    terminal_state,
+                    digest=digest,
+                    reply=validated["reply"] if status == "replied" else None,
+                    completed_at=validated["completed_at"],
+                )
                 return
             await asyncio.sleep(min(self.poll_seconds, 2.0))
         self.store.transition_diagnostic(diagnostic_id, "uncertain")
+
+    async def _fail_diagnostic_before_post(
+        self, diagnostic_id: str, chief: WorkerConfig, lease_store: VaultLeaseStore
+    ) -> None:
+        """Release a known lease when request preparation failed before POST."""
+        try:
+            await asyncio.to_thread(
+                lease_store.release,
+                chief.lease_worker,
+                owner=LEASE_OWNER,
+                job_id=diagnostic_id,
+            )
+            self.store.transition_diagnostic(diagnostic_id, "delivery_failed")
+        except (VaultError, JobStateError):
+            self._mark_diagnostic_uncertain(diagnostic_id)
+
+    def _mark_diagnostic_uncertain(self, diagnostic_id: str) -> None:
+        try:
+            record = self.store.get_diagnostic(diagnostic_id)
+            if record is not None and record.state in {"queued", "dispatching", "dispatched"}:
+                self.store.transition_diagnostic(diagnostic_id, "uncertain")
+        except JobStateError:
+            LOGGER.error("diagnostic outcome needs manual journal reconciliation")
 
     def diagnostic_result(self, diagnostic_id: str) -> dict[str, str | None]:
         """Read durable diagnostic status; a Bot reply is advisory only."""
@@ -588,10 +649,12 @@ class Coordinator:
             raise CoordinatorError("callback inbox is not configured")
         try:
             selected_root = Path(root).resolve(strict=True)
+            self.config.require_x_query_worker(worker_id)
             worker = self.config.require_workspace(selected_root, worker_id)
-            self.config.require_job_type(worker_id, "x_query")
         except (ConfigError, OSError) as error:
-            raise CoordinatorError("workspace opt-in or selected snapshot is invalid") from error
+            raise CoordinatorError(
+                "x_query requires an opted-in, configured same-account Chief of Staff worker"
+            ) from error
         job_id = str(uuid4())
         deadline = datetime.now(UTC) + MAX_JOB_DURATION
         try:
@@ -634,6 +697,14 @@ class Coordinator:
             lease = await asyncio.to_thread(
                 lease_store.acquire, worker.lease_worker, owner=LEASE_OWNER, job_id=job_id
             )
+        except WorkerBusy:
+            self.store.advance(job_id, "failed")
+            return
+        except VaultError:
+            # Do not try to release an acquisition whose CAS result is unknown.
+            self._uncertain(job_id)
+            return
+        try:
             self.store.advance(job_id, "lease_held")
             secret = await asyncio.to_thread(vault.read_secret, worker.webhook_secret_path)
             url, sender_key = secret.get("webhook_url"), secret.get("sender_key")
@@ -651,22 +722,34 @@ class Coordinator:
             )
             webhook = WebhookTransport(url, sender_key, self.config.webhook_ca_file)
             self.store.advance(job_id, "dispatching")
-        except WorkerBusy:
-            self.store.advance(job_id, "failed")
-            return
         except (VaultError, ControlError, PacketError, JobStateError, InboxError):
-            control = GitHubControl(
-                vault,
-                worker.app_secret_path,
-                self.config.control_repository,
-                self.config.github_ca_file,
-            )
-            await self._fail_before_post(job_id, worker, lease_store, control, None)
+            try:
+                await asyncio.to_thread(
+                    lease_store.release,
+                    worker.lease_worker,
+                    owner=LEASE_OWNER,
+                    job_id=job_id,
+                )
+                self.store.advance(job_id, "failed")
+            except (VaultError, JobStateError):
+                self._uncertain(job_id)
             return
         try:
             await asyncio.to_thread(webhook.dispatch, packet)
-        except (WebhookUncertain, ControlError):
+        except WebhookUncertain:
             self._uncertain(job_id)
+            return
+        except ControlError:
+            try:
+                await asyncio.to_thread(
+                    lease_store.release,
+                    worker.lease_worker,
+                    owner=LEASE_OWNER,
+                    job_id=job_id,
+                )
+                self.store.advance(job_id, "failed")
+            except (VaultError, JobStateError):
+                self._uncertain(job_id)
             return
         try:
             self.store.advance(job_id, "dispatched")

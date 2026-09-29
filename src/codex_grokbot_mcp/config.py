@@ -305,3 +305,18 @@ class Config:
         ):
             raise ConfigError("configured Chief of Staff account mapping is invalid")
         return chief, target.diagnostic_target_bot
+
+    def require_x_query_worker(self, worker_id: str) -> WorkerConfig:
+        """Allow X queries only on a same-account CoS mapped by a coding worker."""
+        chief = self.workers.get(worker_id)
+        if chief is None or "x_query" not in chief.job_types:
+            raise ConfigError("worker is not a configured Chief of Staff for x_query")
+        for target in self.workers.values():
+            if target.diagnostic_chief_worker_id != worker_id:
+                continue
+            if "coding" not in target.job_types:
+                raise ConfigError("Chief of Staff mapping target is not a coding worker")
+            mapped_chief, _target_bot = self.require_diagnostic_route(target.worker_id)
+            if mapped_chief.worker_id == worker_id:
+                return chief
+        raise ConfigError("worker is not mapped as a same-account Chief of Staff")
