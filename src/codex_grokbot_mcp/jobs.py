@@ -504,8 +504,13 @@ class JobStore:
             raise JobStateError("diagnostic callback digest is invalid")
         state = row["state"]
         if state not in {
-            "queued", "dispatching", "dispatched", "replied", "no_reply",
-            "delivery_failed", "uncertain",
+            "queued",
+            "dispatching",
+            "dispatched",
+            "replied",
+            "no_reply",
+            "delivery_failed",
+            "uncertain",
         }:
             raise JobStateError("diagnostic state is invalid")
         record = DiagnosticRecord(
@@ -579,9 +584,7 @@ class JobStore:
         if record is None or state not in transitions.get(record.state, set()):
             raise JobStateError("diagnostic state transition is not allowed")
         has_callback = digest is not None or completed_at is not None
-        if state in {"replied", "no_reply"} or (
-            state == "delivery_failed" and has_callback
-        ):
+        if state in {"replied", "no_reply"} or (state == "delivery_failed" and has_callback):
             if (
                 not isinstance(digest, str)
                 or not re.fullmatch(r"[0-9a-f]{64}", digest)

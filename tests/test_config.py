@@ -132,7 +132,7 @@ def diagnostic_config_text(workspace: Path, ca: Path, *, account: str = "supergr
     marker = f"[workspaces.{json.dumps(str(workspace))}]"
     source = source.replace(
         marker,
-        '[workers.chief]\n'
+        "[workers.chief]\n"
         'webhook_secret_path = "webhooks/chief"\n'
         'app_secret_path = "github/chief"\n'
         'lease_prefix = "leases"\n'
@@ -174,9 +174,7 @@ def test_partial_diagnostic_route_is_rejected(paths, tmp_path: Path) -> None:
     workspace, ca = paths
     source = config_text(workspace, ca).replace(
         'lease_worker = "coder"\n',
-        'lease_worker = "coder"\n'
-        'account_id = "supergrok"\n'
-        'diagnostic_chief_worker_id = "chief"\n',
+        'lease_worker = "coder"\naccount_id = "supergrok"\ndiagnostic_chief_worker_id = "chief"\n',
     )
     with pytest.raises(ConfigError, match="incomplete"):
         Config.load(write_config(tmp_path, source))

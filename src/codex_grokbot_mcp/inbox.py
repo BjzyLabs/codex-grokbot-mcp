@@ -41,8 +41,10 @@ class InboxClient:
             self.origin = canonical_inbox_origin(origin)
         except PacketError as error:
             raise InboxError("callback inbox origin is invalid") from error
-        if not isinstance(requestor_token, str) or not requestor_token or any(
-            character.isspace() or ord(character) < 32 for character in requestor_token
+        if (
+            not isinstance(requestor_token, str)
+            or not requestor_token
+            or any(character.isspace() or ord(character) < 32 for character in requestor_token)
         ):
             raise InboxError("callback inbox credential is invalid")
         self._authorization = f"Bearer {requestor_token}"

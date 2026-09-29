@@ -149,9 +149,7 @@ def inspect_coding_job(config: Config, record: JobRecord | None, job_id: str) ->
         pr_evidence = [_pull_request_evidence(pr) for pr in search.matches]
         if not search.matches:
             status = (
-                "no_matching_exact_head_pr"
-                if search.complete
-                else "search_incomplete_no_match"
+                "no_matching_exact_head_pr" if search.complete else "search_incomplete_no_match"
             )
             pull_request = {
                 "status": status,

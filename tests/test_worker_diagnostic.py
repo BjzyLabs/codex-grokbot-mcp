@@ -83,8 +83,7 @@ def test_diagnostic_result_accepts_exact_advisory_response() -> None:
     }
 
     assert (
-        validate_worker_diagnostic_result(JOB_ID, TARGET_JOB_ID, "devcoder", body, now=now)
-        == body
+        validate_worker_diagnostic_result(JOB_ID, TARGET_JOB_ID, "devcoder", body, now=now) == body
     )
 
 
@@ -134,8 +133,7 @@ def test_diagnostic_no_reply_requires_null_reply() -> None:
     }
 
     assert (
-        validate_worker_diagnostic_result(JOB_ID, TARGET_JOB_ID, "devcoder", body, now=now)
-        == body
+        validate_worker_diagnostic_result(JOB_ID, TARGET_JOB_ID, "devcoder", body, now=now) == body
     )
 
 
@@ -183,9 +181,7 @@ def test_diagnostic_result_rejects_exact_callback_credential() -> None:
         )
 
 
-@pytest.mark.parametrize(
-    "prefix", ["ghp_", "ghs_", "ghu_", "gho_", "ghr_", "github_pat_"]
-)
+@pytest.mark.parametrize("prefix", ["ghp_", "ghs_", "ghu_", "gho_", "ghr_", "github_pat_"])
 def test_diagnostic_result_rejects_github_token_prefixes(prefix: str) -> None:
     now = datetime.now(UTC)
     body = {

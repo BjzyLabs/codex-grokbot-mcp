@@ -164,9 +164,7 @@ def test_vault_inbox_client_loads_requestor_token_lazily_once() -> None:
             reads.append(path)
             return {"requestor_token": REQUESTOR}
 
-    client = VaultInboxClient(
-        "https://inbox.example.invalid", "inbox/requestor", None, FakeVault
-    )
+    client = VaultInboxClient("https://inbox.example.invalid", "inbox/requestor", None, FakeVault)
     assert client._get_client() is client._get_client()
     assert reads == ["inbox/requestor"]
 
