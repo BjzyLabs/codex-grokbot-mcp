@@ -26,9 +26,13 @@ from .vault import MAX_JOB_DURATION, VaultClient
 
 GITHUB_API = "https://api.github.com"
 TOKEN_PERMISSIONS = {"contents": "write", "pull_requests": "write"}
+READ_TOKEN_PERMISSIONS = {"contents": "read", "pull_requests": "read"}
 MAX_API_BYTES = 2 * 1024 * 1024
 MAX_WEBHOOK_BYTES = 2 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 1536 * 1024
+INSPECTION_PR_PER_PAGE = 100
+INSPECTION_PR_MAX_PAGES = 5
+INSPECTION_PR_MATCH_LIMIT = 25
 TOKEN_MINIMUM = MAX_JOB_DURATION + timedelta(minutes=5)
 REPO_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 BRANCH_PATTERN = re.compile(r"grokbot/job-coding-[0-9a-f]{8}\Z")
@@ -68,6 +72,27 @@ class InstallationToken:
 class ArtifactPR:
     number: int
     head_sha: str
+
+
+@dataclass(frozen=True)
+class InspectionPR:
+    number: int
+    state: str
+    draft: bool
+    merged_at: str | None
+    head_sha: str
+    head_ref: str
+    head_repository: str
+    base_ref: str
+    base_repository: str
+
+
+@dataclass(frozen=True)
+class InspectionPRSearch:
+    matches: tuple[InspectionPR, ...]
+    complete: bool
+    pages_scanned: int
+    matches_truncated: bool
 
 
 def _base64url(data: bytes) -> str:
@@ -169,6 +194,15 @@ class GitHubControl:
             raise ControlError("GitHub response is malformed") from error
 
     def mint_worker_token(self) -> InstallationToken:
+        return self._mint_token(TOKEN_PERMISSIONS, minimum_lifetime=TOKEN_MINIMUM)
+
+    def mint_read_token(self) -> InstallationToken:
+        """Mint a short-lived token limited to reading this control repository."""
+        return self._mint_token(READ_TOKEN_PERMISSIONS, minimum_lifetime=timedelta(minutes=1))
+
+    def _mint_token(
+        self, permissions: dict[str, str], *, minimum_lifetime: timedelta
+    ) -> InstallationToken:
         secret = self.vault.read_secret(self.app_secret_path)
         app_id = secret.get("github_app_id")
         installation_id = secret.get("github_app_installation_id")
@@ -184,7 +218,7 @@ class GitHubControl:
             auth=jwt,
             payload={
                 "repositories": [self.control_repository.split("/", 1)[1]],
-                "permissions": TOKEN_PERMISSIONS,
+                "permissions": permissions,
             },
         )
         if status != 201 or not isinstance(response, dict):
@@ -195,7 +229,9 @@ class GitHubControl:
         if not isinstance(token, str) or not token:
             raise ControlError("GitHub issued no installation token")
         try:
-            result = self._validated_token(token, response)
+            result = self._validated_token(
+                token, response, permissions=permissions, minimum_lifetime=minimum_lifetime
+            )
         except ControlError as error:
             try:
                 self.revoke_token(token)
@@ -206,7 +242,14 @@ class GitHubControl:
             raise TokenScopeError("token scope or lifetime is invalid") from error
         return result
 
-    def _validated_token(self, token: str, response: dict) -> InstallationToken:
+    def _validated_token(
+        self,
+        token: str,
+        response: dict,
+        *,
+        permissions: dict[str, str] = TOKEN_PERMISSIONS,
+        minimum_lifetime: timedelta = TOKEN_MINIMUM,
+    ) -> InstallationToken:
         repositories = response.get("repositories")
         if (
             not isinstance(repositories, list)
@@ -215,14 +258,14 @@ class GitHubControl:
             or repositories[0].get("full_name") != self.control_repository
         ):
             raise TokenScopeError("installation token repository scope is invalid")
-        permissions = response.get("permissions")
-        if not isinstance(permissions, dict) or any(
-            permissions.get(key) != value for key, value in TOKEN_PERMISSIONS.items()
+        granted_permissions = response.get("permissions")
+        if not isinstance(granted_permissions, dict) or any(
+            granted_permissions.get(key) != value for key, value in permissions.items()
         ):
             raise TokenScopeError("installation token permissions are invalid")
         if any(
-            key not in (*TOKEN_PERMISSIONS, "metadata") or (key == "metadata" and value != "read")
-            for key, value in permissions.items()
+            key not in (*permissions, "metadata") or (key == "metadata" and value != "read")
+            for key, value in granted_permissions.items()
         ):
             raise TokenScopeError("installation token has excess permissions")
         expiry = response.get("expires_at")
@@ -234,7 +277,7 @@ class GitHubControl:
             raise TokenScopeError("installation token expiry is invalid") from error
         if (
             expires_at.tzinfo is None
-            or expires_at.astimezone(UTC) - datetime.now(UTC) < TOKEN_MINIMUM
+            or expires_at.astimezone(UTC) - datetime.now(UTC) < minimum_lifetime
         ):
             raise TokenScopeError("installation token expires too soon")
         return InstallationToken(token, expires_at.astimezone(UTC))
@@ -280,6 +323,118 @@ class GitHubControl:
             ):
                 return ArtifactPR(number, sha)
         return None
+
+    def find_inspection_prs(self, token: str, branch: str) -> InspectionPRSearch:
+        """Find bounded exact-head PR evidence in every lifecycle state.
+
+        This is for read-only reconciliation only. Coding acceptance continues to use
+        ``find_artifact_pr``, which requires an open draft PR targeting main.
+        """
+        if not BRANCH_PATTERN.fullmatch(branch):
+            raise ControlError("artifact branch name is invalid")
+        owner = self.control_repository.split("/", 1)[0]
+        matches: list[InspectionPR] = []
+        seen_numbers: set[int] = set()
+        complete = True
+        pages_scanned = 0
+        for page in range(1, INSPECTION_PR_MAX_PAGES + 1):
+            query = urllib.parse.urlencode(
+                {
+                    "state": "all",
+                    "head": f"{owner}:{branch}",
+                    "per_page": INSPECTION_PR_PER_PAGE,
+                    "page": page,
+                    "sort": "created",
+                    "direction": "desc",
+                }
+            )
+            status, response = self._request(
+                f"/repos/{self.control_repository}/pulls?{query}", auth=token
+            )
+            pages_scanned = page
+            if status != 200 or not isinstance(response, list):
+                raise ControlError("GitHub PR inspection listing is malformed")
+            if len(response) > INSPECTION_PR_PER_PAGE:
+                raise ControlError("GitHub PR inspection page exceeds its bound")
+            for entry in response:
+                if not isinstance(entry, dict):
+                    complete = False
+                    continue
+                head, base = entry.get("head"), entry.get("base")
+                head_repo = head.get("repo") if isinstance(head, dict) else None
+                base_repo = base.get("repo") if isinstance(base, dict) else None
+                number = entry.get("number")
+                state, draft, merged_at = (
+                    entry.get("state"),
+                    entry.get("draft"),
+                    entry.get("merged_at"),
+                )
+                head_ref = head.get("ref") if isinstance(head, dict) else None
+                head_sha = head.get("sha") if isinstance(head, dict) else None
+                head_repository = (
+                    head_repo.get("full_name") if isinstance(head_repo, dict) else None
+                )
+                base_ref = base.get("ref") if isinstance(base, dict) else None
+                base_repository = (
+                    base_repo.get("full_name") if isinstance(base_repo, dict) else None
+                )
+                if (
+                    not isinstance(number, int)
+                    or number <= 0
+                    or state not in ("open", "closed")
+                    or not isinstance(draft, bool)
+                    or (
+                        merged_at is not None
+                        and (
+                            not isinstance(merged_at, str)
+                            or not merged_at
+                            or len(merged_at) > 64
+                            or any(ord(character) < 32 for character in merged_at)
+                        )
+                    )
+                    or not isinstance(head_ref, str)
+                    or not isinstance(head_sha, str)
+                    or not SHA_PATTERN.fullmatch(head_sha)
+                    or not isinstance(head_repository, str)
+                    or not isinstance(base_ref, str)
+                    or not base_ref
+                    or len(base_ref) > 255
+                    or any(ord(character) < 32 for character in base_ref)
+                    or not isinstance(base_repository, str)
+                    or not REPO_PATTERN.fullmatch(base_repository)
+                    or any(part in (".", "..") for part in base_repository.split("/"))
+                ):
+                    complete = False
+                    continue
+                if head_ref != branch or head_repository != self.control_repository:
+                    continue
+                if number in seen_numbers:
+                    complete = False
+                    continue
+                seen_numbers.add(number)
+                matches.append(
+                    InspectionPR(
+                        number,
+                        state,
+                        draft,
+                        merged_at,
+                        head_sha,
+                        head_ref,
+                        head_repository,
+                        base_ref,
+                        base_repository,
+                    )
+                )
+            if len(response) < INSPECTION_PR_PER_PAGE:
+                break
+        else:
+            complete = False
+        return InspectionPRSearch(
+            tuple(matches[:INSPECTION_PR_MATCH_LIMIT]),
+            complete,
+            pages_scanned,
+            len(matches) > INSPECTION_PR_MATCH_LIMIT,
+        )
 
     def read_artifact(self, token: str, path: str, head_sha: str) -> dict:
         if not ARTIFACT_PATTERN.fullmatch(path) or not SHA_PATTERN.fullmatch(head_sha):

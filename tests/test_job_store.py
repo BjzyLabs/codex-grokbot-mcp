@@ -57,6 +57,17 @@ def create_job(store: JobStore, context) -> None:
     )
 
 
+def create_uuid_job(store: JobStore, context) -> None:
+    store.create(
+        "1234abcd-1234-4123-8123-123456789abc",
+        "worker-a",
+        context,
+        lease_owner="codex-grokbot-mcp",
+        control_branch="grokbot/job-coding-1234abcd",
+        artifact_path="artifacts/patch-1234abcd.json",
+    )
+
+
 def test_private_store_and_no_source_content_survive_reopen(tmp_path: Path, context) -> None:
     store = new_store(tmp_path)
     create_job(store, context)
@@ -76,6 +87,93 @@ def test_private_store_and_no_source_content_survive_reopen(tmp_path: Path, cont
     assert record.lease_owner == "codex-grokbot-mcp"
     assert record.read_paths == ("module.py",)
     reopened.close()
+
+
+def test_diagnostic_journal_persists_advisory_reply_without_callback_token(
+    tmp_path: Path, context
+) -> None:
+    store = new_store(tmp_path)
+    create_uuid_job(store, context)
+    diagnostic_id = "2345abcd-1234-4123-8123-123456789abc"
+    store.create_diagnostic(
+        diagnostic_id,
+        "1234abcd-1234-4123-8123-123456789abc",
+        "worker-a",
+        "chief-of-staff",
+        "devcoder",
+    )
+    store.transition_diagnostic(diagnostic_id, "dispatching")
+    store.transition_diagnostic(diagnostic_id, "dispatched")
+    store.transition_diagnostic(
+        diagnostic_id,
+        "replied",
+        digest="a" * 64,
+        reply="Finished; draft PR is open.",
+        completed_at="2026-09-28T12:00:00Z",
+    )
+    store.close()
+
+    reopened = JobStore.open(tmp_path / "private" / "jobs.sqlite3")
+    record = reopened.get_diagnostic(diagnostic_id)
+    assert record is not None
+    assert record.state == "replied"
+    assert record.target_job_id == "1234abcd-1234-4123-8123-123456789abc"
+    assert record.reply == "Finished; draft PR is open."
+    assert record.callback_body_sha256 == "a" * 64
+    assert b"callback_token" not in (tmp_path / "private" / "jobs.sqlite3").read_bytes()
+    reopened.close()
+
+
+def test_pending_diagnostic_becomes_uncertain_after_restart(tmp_path: Path, context) -> None:
+    store = new_store(tmp_path)
+    create_uuid_job(store, context)
+    diagnostic_id = "2345abcd-1234-4123-8123-123456789abc"
+    store.create_diagnostic(
+        diagnostic_id,
+        "1234abcd-1234-4123-8123-123456789abc",
+        "worker-a",
+        "chief-of-staff",
+        "coder",
+    )
+    store.transition_diagnostic(diagnostic_id, "dispatching")
+    store.close()
+
+    reopened = JobStore.open(tmp_path / "private" / "jobs.sqlite3")
+    reopened.reconcile_restart()
+    assert reopened.get_diagnostic(diagnostic_id).state == "uncertain"
+    with pytest.raises(JobStateError, match="transition"):
+        reopened.transition_diagnostic(diagnostic_id, "dispatched")
+    reopened.close()
+
+
+def test_no_reply_state_is_only_stored_with_validated_callback_evidence(
+    tmp_path: Path, context
+) -> None:
+    store = new_store(tmp_path)
+    create_uuid_job(store, context)
+    diagnostic_id = "2345abcd-1234-4123-8123-123456789abc"
+    store.create_diagnostic(
+        diagnostic_id,
+        "1234abcd-1234-4123-8123-123456789abc",
+        "worker-a",
+        "chief-of-staff",
+        "coder",
+    )
+    store.transition_diagnostic(diagnostic_id, "dispatching")
+    store.transition_diagnostic(diagnostic_id, "dispatched")
+    with pytest.raises(JobStateError, match="callback identity"):
+        store.transition_diagnostic(diagnostic_id, "no_reply")
+    store.transition_diagnostic(
+        diagnostic_id,
+        "no_reply",
+        digest="b" * 64,
+        completed_at="2026-09-28T12:00:00Z",
+    )
+    record = store.get_diagnostic(diagnostic_id)
+    assert record.state == "no_reply"
+    assert record.callback_body_sha256 == "b" * 64
+    assert record.completed_at == "2026-09-28T12:00:00Z"
+    store.close()
 
 
 def test_transitions_are_atomic_and_restart_is_uncertain(tmp_path: Path, context) -> None:
@@ -294,7 +392,7 @@ def test_schema_v1_journal_migrates_without_losing_jobs(
     assert store.get("job-123").state == "uncertain"
     store.close()
     with sqlite3.connect(db) as check:
-        assert check.execute("SELECT version FROM schema_version").fetchone()[0] == 4
+        assert check.execute("SELECT version FROM schema_version").fetchone()[0] == 5
 
 
 def test_validated_artifact_identity_is_required_and_survives_restart(
@@ -399,7 +497,7 @@ def test_schema_v2_journal_migrates_without_losing_dispatch_evidence(
     assert record.artifact_sha256 is None
     store.close()
     with sqlite3.connect(db) as check:
-        assert check.execute("SELECT version FROM schema_version").fetchone()[0] == 4
+        assert check.execute("SELECT version FROM schema_version").fetchone()[0] == 5
 
 
 def test_artifact_digest_is_canonical_and_rejects_non_json_values() -> None:
