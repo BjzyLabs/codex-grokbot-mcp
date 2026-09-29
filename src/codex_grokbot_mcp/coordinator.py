@@ -21,9 +21,11 @@ from codex_grokbot_mcp.control import (
 )
 from codex_grokbot_mcp.deliver import (
     build_v3_coding_packet,
+    build_worker_diagnostic_packet,
     build_x_query_packet,
     interpret_status,
     validate_status_body,
+    validate_worker_diagnostic_result,
     validate_x_query_result,
 )
 from codex_grokbot_mcp.inbox import InboxError, token_hash
@@ -41,6 +43,8 @@ from codex_grokbot_mcp.vault import (
 LOGGER = logging.getLogger(__name__)
 LEASE_RENEW_MARGIN = timedelta(minutes=1)
 LEASE_OWNER = "codex-grokbot-mcp"
+DIAGNOSTIC_MAX_WAIT_SECONDS = 120
+DIAGNOSTIC_CALLBACK_GRACE_SECONDS = 90
 
 
 class CoordinatorError(ValueError):
@@ -145,6 +149,159 @@ class Coordinator:
         self._tasks[job_id] = task
         task.add_done_callback(lambda _completed: self._tasks.pop(job_id, None))
         return {"job_id": job_id, "state": "queued"}
+
+    async def diagnose(self, target_job_id: str) -> dict[str, str]:
+        """Ask the configured same-account Chief of Staff for a read-only job status."""
+        if self._inbox() is None or self.config.result_inbox_base_url is None:
+            raise CoordinatorError("authenticated callback inbox is not configured")
+        try:
+            target = self.store.get(target_job_id)
+            if target is None or target.job_type != "coding":
+                raise CoordinatorError("diagnostic target must be a recorded coding job")
+            chief, target_bot = self.config.require_diagnostic_route(target.worker_id)
+        except (ConfigError, JobStateError) as error:
+            raise CoordinatorError("diagnostic target or account routing is unavailable") from error
+        diagnostic_id = str(uuid4())
+        try:
+            self.store.create_diagnostic(
+                diagnostic_id,
+                target.job_id,
+                target.worker_id,
+                chief.worker_id,
+                target_bot,
+            )
+        except JobStateError as error:
+            raise CoordinatorError("diagnostic request could not be recorded") from error
+        task = asyncio.create_task(
+            self._run_diagnostic(diagnostic_id, chief, target_bot),
+            name=f"grokbot-diagnostic-{diagnostic_id[:8]}",
+        )
+        self._tasks[diagnostic_id] = task
+        task.add_done_callback(lambda _completed: self._tasks.pop(diagnostic_id, None))
+        return {"job_id": diagnostic_id, "state": "queued"}
+
+    async def _run_diagnostic(
+        self, diagnostic_id: str, chief: WorkerConfig, target_bot: str
+    ) -> None:
+        try:
+            await self._execute_diagnostic(diagnostic_id, chief, target_bot)
+        except Exception:
+            try:
+                record = self.store.get_diagnostic(diagnostic_id)
+                if record is not None and record.state in {"queued", "dispatching", "dispatched"}:
+                    self.store.transition_diagnostic(diagnostic_id, "uncertain")
+            except JobStateError:
+                pass
+            LOGGER.error("worker diagnostic outcome is uncertain; it will not be retried")
+
+    async def _execute_diagnostic(
+        self, diagnostic_id: str, chief: WorkerConfig, target_bot: str
+    ) -> None:
+        inbox = self._inbox()
+        if inbox is None or self.config.result_inbox_base_url is None:
+            self.store.transition_diagnostic(diagnostic_id, "delivery_failed")
+            return
+        record = self.store.get_diagnostic(diagnostic_id)
+        if record is None:
+            raise JobStateError("diagnostic journal record disappeared")
+        vault = self.config.vault_client()
+        callback_token = secrets.token_urlsafe(32)
+        deadline = datetime.now(UTC) + timedelta(
+            seconds=DIAGNOSTIC_MAX_WAIT_SECONDS + DIAGNOSTIC_CALLBACK_GRACE_SECONDS
+        )
+        try:
+            secret = await asyncio.to_thread(vault.read_secret, chief.webhook_secret_path)
+            url, sender_key = secret.get("webhook_url"), secret.get("sender_key")
+            if not isinstance(url, str) or not isinstance(sender_key, str):
+                raise ControlError("Chief of Staff webhook secret is incomplete")
+            webhook = WebhookTransport(url, sender_key, self.config.webhook_ca_file)
+            await asyncio.to_thread(
+                inbox.register,
+                diagnostic_id,
+                "result",
+                token_hash(callback_token),
+                deadline,
+            )
+            packet = build_worker_diagnostic_packet(
+                job_id=diagnostic_id,
+                target_job_id=record.target_job_id,
+                target_bot=target_bot,
+                origin=self.config.result_inbox_base_url,
+                callback_token=callback_token,
+            )
+            self.store.transition_diagnostic(diagnostic_id, "dispatching")
+        except (VaultError, ControlError, InboxError, PacketError, JobStateError):
+            self.store.transition_diagnostic(diagnostic_id, "delivery_failed")
+            return
+        try:
+            await asyncio.to_thread(webhook.dispatch, packet)
+        except (WebhookUncertain, ControlError):
+            self.store.transition_diagnostic(diagnostic_id, "uncertain")
+            return
+        self.store.transition_diagnostic(diagnostic_id, "dispatched")
+        while datetime.now(UTC) < deadline:
+            try:
+                payload = await asyncio.to_thread(inbox.fetch, diagnostic_id, "result")
+            except InboxError:
+                self.store.transition_diagnostic(diagnostic_id, "uncertain")
+                return
+            if payload and payload.get("stored"):
+                body = payload.get("body")
+                try:
+                    validated = validate_worker_diagnostic_result(
+                        diagnostic_id,
+                        record.target_job_id,
+                        target_bot,
+                        body,
+                        now=datetime.now(UTC),
+                        forbidden_values=(callback_token,),
+                    )
+                except (PacketError, TypeError):
+                    self.store.transition_diagnostic(diagnostic_id, "uncertain")
+                    return
+                status = validated["status"]
+                if status == "replied":
+                    self.store.transition_diagnostic(
+                        diagnostic_id,
+                        "replied",
+                        digest=payload.get("body_sha256"),
+                        reply=validated["reply"],
+                        completed_at=validated["completed_at"],
+                    )
+                elif status == "no_reply":
+                    self.store.transition_diagnostic(
+                        diagnostic_id,
+                        "no_reply",
+                        digest=payload.get("body_sha256"),
+                        completed_at=validated["completed_at"],
+                    )
+                else:
+                    self.store.transition_diagnostic(
+                        diagnostic_id,
+                        "delivery_failed",
+                        digest=payload.get("body_sha256"),
+                        completed_at=validated["completed_at"],
+                    )
+                return
+            await asyncio.sleep(min(self.poll_seconds, 2.0))
+        self.store.transition_diagnostic(diagnostic_id, "uncertain")
+
+    def diagnostic_result(self, diagnostic_id: str) -> dict[str, str | None]:
+        """Read durable diagnostic status; a Bot reply is advisory only."""
+        try:
+            record = self.store.get_diagnostic(diagnostic_id)
+        except JobStateError as error:
+            raise CoordinatorError("diagnostic status is unavailable") from error
+        if record is None:
+            return {"job_id": diagnostic_id, "state": "not_found", "reply": None}
+        return {
+            "job_id": record.diagnostic_id,
+            "target_job_id": record.target_job_id,
+            "target_bot": record.target_bot,
+            "state": record.state,
+            "reply": record.reply,
+            "completed_at": record.completed_at,
+        }
 
     def _uncertain(self, job_id: str) -> None:
         """Record an outcome that cannot justify retry or lease release."""

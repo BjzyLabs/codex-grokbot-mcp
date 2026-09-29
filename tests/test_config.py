@@ -117,3 +117,64 @@ def test_missing_approle_file_is_rejected(paths, tmp_path: Path) -> None:
     (tmp_path / "private" / "secret_id").unlink()
     with pytest.raises(ConfigError, match="credential"):
         Config.load(write_config(tmp_path, config_text(workspace, ca)))
+
+
+def diagnostic_config_text(workspace: Path, ca: Path, *, account: str = "supergrok") -> str:
+    source = config_text(workspace, ca)
+    source = source.replace(
+        'lease_worker = "coder"\n',
+        'lease_worker = "coder"\n'
+        'job_types = ["coding"]\n'
+        f'account_id = "{account}"\n'
+        'diagnostic_chief_worker_id = "chief"\n'
+        'diagnostic_target_bot = "devcoder"\n',
+    )
+    marker = f"[workspaces.{json.dumps(str(workspace))}]"
+    source = source.replace(
+        marker,
+        "[workers.chief]\n"
+        'webhook_secret_path = "webhooks/chief"\n'
+        'app_secret_path = "github/chief"\n'
+        'lease_prefix = "leases"\n'
+        'lease_worker = "chief"\n'
+        'job_types = ["x_query", "worker_diagnostic"]\n'
+        f'account_id = "{account}"\n\n'
+        f"{marker}",
+    )
+    return source
+
+
+def test_diagnostic_route_requires_explicit_same_account_bot_mapping(paths, tmp_path: Path) -> None:
+    workspace, ca = paths
+    config = Config.load(write_config(tmp_path, diagnostic_config_text(workspace, ca)))
+    chief, target_bot = config.require_diagnostic_route("coder")
+    assert chief.worker_id == "chief"
+    assert target_bot == "devcoder"
+
+
+def test_diagnostic_route_rejects_cross_account_or_missing_receiver(paths, tmp_path: Path) -> None:
+    workspace, ca = paths
+    config = Config.load(
+        write_config(tmp_path, diagnostic_config_text(workspace, ca, account="account-a"))
+    )
+    config.workers["chief"] = config.workers["chief"].__class__(
+        "chief",
+        "webhooks/chief",
+        "github/chief",
+        "leases",
+        "chief",
+        frozenset({"x_query", "worker_diagnostic"}),
+        "account-b",
+    )
+    with pytest.raises(ConfigError, match="account mapping"):
+        config.require_diagnostic_route("coder")
+
+
+def test_partial_diagnostic_route_is_rejected(paths, tmp_path: Path) -> None:
+    workspace, ca = paths
+    source = config_text(workspace, ca).replace(
+        'lease_worker = "coder"\n',
+        'lease_worker = "coder"\naccount_id = "supergrok"\ndiagnostic_chief_worker_id = "chief"\n',
+    )
+    with pytest.raises(ConfigError, match="incomplete"):
+        Config.load(write_config(tmp_path, source))

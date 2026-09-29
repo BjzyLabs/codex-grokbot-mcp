@@ -7,7 +7,15 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from codex_grokbot_mcp.inbox import CALLBACK_BODY_LIMIT, Inbox, InboxError, InboxServer, token_hash
+from codex_grokbot_mcp.inbox import (
+    CALLBACK_BODY_LIMIT,
+    Inbox,
+    InboxClient,
+    InboxError,
+    InboxServer,
+    VaultInboxClient,
+    token_hash,
+)
 
 JOB_ID = "1234abcd-1234-4123-8123-123456789abc"
 REQUESTOR = "requestor-fixture-token"
@@ -111,3 +119,58 @@ def test_oversized_body_is_rejected(server) -> None:
     huge = b"{" + b"x" * (CALLBACK_BODY_LIMIT + 10)
     status, _ = _request(f"{base}/jobs/{JOB_ID}/status", method="POST", token=WORKER, body=huge)
     assert status == 413
+
+
+def test_authenticated_https_client_registers_hash_and_reads_exact_job() -> None:
+    client = InboxClient("https://inbox.example.invalid", REQUESTOR)
+
+    class Response:
+        status = 201
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self, _limit):
+            return b'{"status":"registered"}'
+
+    class Opener:
+        request = None
+
+        def open(self, request, timeout):
+            self.request = request
+            assert timeout == 10
+            return Response()
+
+    opener = Opener()
+    client._opener = opener
+    deadline = datetime.now(UTC) + timedelta(minutes=2)
+    client.register(JOB_ID, "result", token_hash(WORKER), deadline)
+    request = opener.request
+    assert request.full_url == "https://inbox.example.invalid/expectations"
+    assert request.get_method() == "POST"
+    assert request.get_header("Authorization") == f"Bearer {REQUESTOR}"
+    assert WORKER.encode() not in request.data
+    assert token_hash(WORKER).encode() in request.data
+
+
+def test_vault_inbox_client_loads_requestor_token_lazily_once() -> None:
+    reads = []
+
+    class FakeVault:
+        def read_secret(self, path):
+            reads.append(path)
+            return {"requestor_token": REQUESTOR}
+
+    client = VaultInboxClient("https://inbox.example.invalid", "inbox/requestor", None, FakeVault)
+    assert client._get_client() is client._get_client()
+    assert reads == ["inbox/requestor"]
+
+
+def test_inbox_client_rejects_non_https_origin_and_unsafe_token() -> None:
+    with pytest.raises(InboxError, match="origin"):
+        InboxClient("http://inbox.example.invalid", REQUESTOR)
+    with pytest.raises(InboxError, match="credential"):
+        InboxClient("https://inbox.example.invalid", "token with space")

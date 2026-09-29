@@ -16,6 +16,7 @@ from codex_grokbot_mcp.control import (
     ArtifactPR,
     ControlError,
     GitHubControl,
+    InspectionPR,
     TokenScopeError,
     WebhookTransport,
     WebhookUncertain,
@@ -81,6 +82,44 @@ def test_mint_requests_exact_control_repo_and_permissions(tmp_path: Path) -> Non
         "repositories": ["artifact-control"],
         "permissions": {"contents": "write", "pull_requests": "write"},
     }
+
+
+def test_read_token_requests_read_only_permissions() -> None:
+    captured = {}
+    response = token_reply()
+    response["permissions"] = {
+        "contents": "read",
+        "pull_requests": "read",
+        "metadata": "read",
+    }
+
+    def open_request(request, timeout=0, **_kwargs):
+        captured["body"] = json.loads(request.data) if request.data else None
+        return Reply(response, status=201)
+
+    control = GitHubControl(VaultStub(), "apps/worker", REPO)
+    with (
+        mock.patch("codex_grokbot_mcp.control.sign_app_jwt", return_value="signed-jwt"),
+        mock.patch("urllib.request.urlopen", side_effect=open_request),
+    ):
+        token = control.mint_read_token()
+    assert token.value == "synthetic-installation-token"
+    assert captured["body"] == {
+        "repositories": ["artifact-control"],
+        "permissions": {"contents": "read", "pull_requests": "read"},
+    }
+
+
+def test_read_token_rejects_write_scope_and_revokes() -> None:
+    control = GitHubControl(VaultStub(), "apps/worker", REPO)
+    with (
+        mock.patch("codex_grokbot_mcp.control.sign_app_jwt", return_value="signed-jwt"),
+        mock.patch("urllib.request.urlopen", return_value=Reply(token_reply(), status=201)),
+        mock.patch.object(control, "revoke_token") as revoke,
+    ):
+        with pytest.raises(TokenScopeError):
+            control.mint_read_token()
+    revoke.assert_called_once_with("synthetic-installation-token")
 
 
 def test_mint_rejects_wider_scope_and_revokes() -> None:
@@ -174,6 +213,118 @@ def test_rejects_non_draft_or_foreign_pr() -> None:
         ),
     ):
         assert control.find_artifact_pr("token", "grokbot/job-coding-1234abcd") is None
+
+
+def test_inspection_pr_lookup_includes_closed_and_merged_exact_head_matches() -> None:
+    control = GitHubControl(VaultStub(), "apps/worker", REPO)
+    head_sha = "a" * 40
+    captured = []
+
+    def entry(
+        number,
+        *,
+        state="closed",
+        merged_at=None,
+        head_repo=REPO,
+        ref="grokbot/job-coding-1234abcd",
+    ):
+        return {
+            "number": number,
+            "state": state,
+            "draft": False,
+            "merged_at": merged_at,
+            "head": {"ref": ref, "sha": head_sha, "repo": {"full_name": head_repo}},
+            "base": {"ref": "main", "repo": {"full_name": REPO}},
+        }
+
+    def open_request(request, timeout=0, **_kwargs):
+        captured.append(request.full_url)
+        return Reply(
+            [
+                entry(41),
+                entry(42, merged_at="2026-09-28T12:00:00Z"),
+                entry(43, head_repo="example-org/foreign"),
+                entry(44, ref="grokbot/job-coding-deadbeef"),
+            ]
+        )
+
+    with mock.patch("urllib.request.urlopen", side_effect=open_request):
+        result = control.find_inspection_prs("token", "grokbot/job-coding-1234abcd")
+
+    assert result.complete is True
+    assert result.pages_scanned == 1
+    assert [pr.number for pr in result.matches] == [41, 42]
+    assert [pr.merged_at for pr in result.matches] == [None, "2026-09-28T12:00:00Z"]
+    assert all(isinstance(pr, InspectionPR) for pr in result.matches)
+    assert "state=all" in captured[0]
+    assert "head=example-org%3Agrokbot%2Fjob-coding-1234abcd" in captured[0]
+
+
+def test_inspection_pr_lookup_marks_page_cap_incomplete(monkeypatch) -> None:
+    import codex_grokbot_mcp.control as control_module
+
+    control = GitHubControl(VaultStub(), "apps/worker", REPO)
+    monkeypatch.setattr(control_module, "INSPECTION_PR_MAX_PAGES", 1)
+    entries = [
+        {
+            "number": number,
+            "state": "closed",
+            "draft": False,
+            "merged_at": None,
+            "head": {
+                "ref": "grokbot/job-coding-1234abcd",
+                "sha": "a" * 40,
+                "repo": {"full_name": REPO},
+            },
+            "base": {"ref": "main", "repo": {"full_name": REPO}},
+        }
+        for number in range(41, 141)
+    ]
+
+    with mock.patch("urllib.request.urlopen", return_value=Reply(entries)):
+        result = control.find_inspection_prs("token", "grokbot/job-coding-1234abcd")
+
+    assert result.complete is False
+    assert result.pages_scanned == 1
+    assert result.matches_truncated is True
+
+
+def test_inspection_pr_lookup_paginates_before_reporting_matches() -> None:
+    control = GitHubControl(VaultStub(), "apps/worker", REPO)
+    head = "grokbot/job-coding-1234abcd"
+    page_urls = []
+    foreign_entries = [
+        {
+            "number": number,
+            "state": "closed",
+            "draft": False,
+            "merged_at": None,
+            "head": {"ref": head, "sha": "a" * 40, "repo": {"full_name": "other/repo"}},
+            "base": {"ref": "main", "repo": {"full_name": REPO}},
+        }
+        for number in range(1, 101)
+    ]
+    merged_entry = {
+        "number": 142,
+        "state": "closed",
+        "draft": False,
+        "merged_at": "2026-09-28T12:00:00Z",
+        "head": {"ref": head, "sha": "b" * 40, "repo": {"full_name": REPO}},
+        "base": {"ref": "main", "repo": {"full_name": REPO}},
+    }
+
+    def open_request(request, timeout=0, **_kwargs):
+        page_urls.append(request.full_url)
+        return Reply(foreign_entries if len(page_urls) == 1 else [merged_entry])
+
+    with mock.patch("urllib.request.urlopen", side_effect=open_request):
+        result = control.find_inspection_prs("token", head)
+
+    assert result.complete is True
+    assert result.pages_scanned == 2
+    assert [pr.number for pr in result.matches] == [142]
+    assert "page=1" in page_urls[0]
+    assert "page=2" in page_urls[1]
 
 
 def test_webhook_timeout_is_uncertain_and_never_retried() -> None:

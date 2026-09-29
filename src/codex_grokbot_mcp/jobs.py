@@ -12,12 +12,14 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
+from uuid import UUID
 
 from codex_grokbot_mcp.control import ARTIFACT_PATTERN, BRANCH_PATTERN, TOKEN_MINIMUM
+from codex_grokbot_mcp.deliver import PacketError, validate_worker_diagnostic_result
 from codex_grokbot_mcp.local import ContractError, DelegationContext, Workspace
 from codex_grokbot_mcp.vault import MAX_JOB_DURATION
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 ACTIVE_STATES = (
     "queued",
     "lease_held",
@@ -139,6 +141,21 @@ class JobRecord:
     terminal_reason: str | None = None
 
 
+@dataclass(frozen=True)
+class DiagnosticRecord:
+    diagnostic_id: str
+    target_job_id: str
+    target_worker_id: str
+    chief_worker_id: str
+    target_bot: str
+    state: str
+    created_at: str
+    updated_at: str
+    callback_body_sha256: str | None
+    reply: str | None
+    completed_at: str | None
+
+
 class JobStore:
     """Journal jobs without retaining delegated source or credentials."""
 
@@ -164,7 +181,7 @@ class JobStore:
                 connection.execute(
                     "INSERT INTO schema_version(version) VALUES (?)", (SCHEMA_VERSION,)
                 )
-            elif len(rows) != 1 or rows[0][0] not in (1, 2, 3, SCHEMA_VERSION):
+            elif len(rows) != 1 or rows[0][0] not in (1, 2, 3, 4, SCHEMA_VERSION):
                 raise JobStateError("job store schema version is unsupported")
             old_version = rows[0][0] if rows else SCHEMA_VERSION
             connection.execute(
@@ -219,6 +236,25 @@ class JobStore:
             )
             connection.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS jobs_artifact_path ON jobs(artifact_path)"
+            )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS worker_diagnostics (
+                    diagnostic_id TEXT PRIMARY KEY,
+                    target_job_id TEXT NOT NULL,
+                    target_worker_id TEXT NOT NULL,
+                    chief_worker_id TEXT NOT NULL,
+                    target_bot TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    callback_body_sha256 TEXT,
+                    reply TEXT,
+                    completed_at TEXT
+                )"""
+            )
+            connection.execute(
+                """CREATE INDEX IF NOT EXISTS worker_diagnostics_target
+                   ON worker_diagnostics(target_job_id, created_at)"""
             )
             connection.commit()
         except (sqlite3.Error, JobStateError) as error:
@@ -407,6 +443,168 @@ class JobStore:
         except sqlite3.IntegrityError as error:
             raise JobStateError("job identity or artifact coordinates already exist") from error
 
+    def create_diagnostic(
+        self,
+        diagnostic_id: str,
+        target_job_id: str,
+        target_worker_id: str,
+        chief_worker_id: str,
+        target_bot: str,
+    ) -> None:
+        """Persist diagnostic correlation without retaining its callback credential."""
+        try:
+            if (
+                str(UUID(diagnostic_id)) != diagnostic_id
+                or str(UUID(target_job_id)) != target_job_id
+            ):
+                raise ValueError
+        except (ValueError, TypeError, AttributeError) as error:
+            raise JobStateError("diagnostic job identities must be canonical UUIDs") from error
+        _identifier(target_worker_id)
+        _identifier(chief_worker_id)
+        if target_bot not in ("coder", "devcoder"):
+            raise JobStateError("diagnostic target Bot is invalid")
+        target = self.get(target_job_id)
+        if target is None or target.job_type != "coding" or target.worker_id != target_worker_id:
+            raise JobStateError("diagnostic target job does not match a recorded coding job")
+        now = _now()
+        try:
+            with self._connection:
+                self._connection.execute(
+                    """INSERT INTO worker_diagnostics (
+                        diagnostic_id, target_job_id, target_worker_id, chief_worker_id,
+                        target_bot, state, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)""",
+                    (
+                        diagnostic_id,
+                        target_job_id,
+                        target_worker_id,
+                        chief_worker_id,
+                        target_bot,
+                        now,
+                        now,
+                    ),
+                )
+        except sqlite3.IntegrityError as error:
+            raise JobStateError("diagnostic identity already exists") from error
+
+    def get_diagnostic(self, diagnostic_id: str) -> DiagnosticRecord | None:
+        try:
+            if str(UUID(diagnostic_id)) != diagnostic_id:
+                raise ValueError
+        except (ValueError, TypeError, AttributeError) as error:
+            raise JobStateError("diagnostic job ID must be a canonical UUID") from error
+        row = self._connection.execute(
+            "SELECT * FROM worker_diagnostics WHERE diagnostic_id=?", (diagnostic_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        digest = row["callback_body_sha256"]
+        if digest is not None and not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise JobStateError("diagnostic callback digest is invalid")
+        state = row["state"]
+        if state not in {
+            "queued",
+            "dispatching",
+            "dispatched",
+            "replied",
+            "no_reply",
+            "delivery_failed",
+            "uncertain",
+        }:
+            raise JobStateError("diagnostic state is invalid")
+        record = DiagnosticRecord(
+            row["diagnostic_id"],
+            row["target_job_id"],
+            row["target_worker_id"],
+            row["chief_worker_id"],
+            row["target_bot"],
+            state,
+            row["created_at"],
+            row["updated_at"],
+            digest,
+            row["reply"],
+            row["completed_at"],
+        )
+        if record.target_bot not in ("coder", "devcoder"):
+            raise JobStateError("diagnostic target Bot is invalid")
+        _identifier(record.target_worker_id)
+        _identifier(record.chief_worker_id)
+        callback_fields = (record.callback_body_sha256, record.reply, record.completed_at)
+        callback_state = state in {"replied", "no_reply"} or (
+            state == "delivery_failed" and record.callback_body_sha256 is not None
+        )
+        if callback_state:
+            if record.callback_body_sha256 is None or record.completed_at is None:
+                raise JobStateError("stored diagnostic callback identity is incomplete")
+            if state == "replied" and record.reply is None:
+                raise JobStateError("stored diagnostic reply is missing")
+            if state != "replied" and record.reply is not None:
+                raise JobStateError("empty diagnostic callback contains a reply")
+            try:
+                validate_worker_diagnostic_result(
+                    record.diagnostic_id,
+                    record.target_job_id,
+                    record.target_bot,
+                    {
+                        "schema_version": "v3",
+                        "job_type": "worker_diagnostic",
+                        "job_id": record.diagnostic_id,
+                        "target_job_id": record.target_job_id,
+                        "target_bot": record.target_bot,
+                        "status": state,
+                        "reply": record.reply,
+                        "completed_at": record.completed_at,
+                        "read_only_attestation": True,
+                    },
+                    now=datetime.now(UTC),
+                )
+            except (PacketError, TypeError) as error:
+                raise JobStateError("stored diagnostic callback failed validation") from error
+        elif any(value is not None for value in callback_fields):
+            raise JobStateError("non-reply diagnostic state contains callback data")
+        return record
+
+    def transition_diagnostic(
+        self,
+        diagnostic_id: str,
+        state: str,
+        *,
+        digest: str | None = None,
+        reply: str | None = None,
+        completed_at: str | None = None,
+    ) -> None:
+        """Apply one durable diagnostic transition using compare-and-set."""
+        record = self.get_diagnostic(diagnostic_id)
+        transitions = {
+            "queued": {"dispatching", "delivery_failed", "uncertain"},
+            "dispatching": {"dispatched", "delivery_failed", "uncertain"},
+            "dispatched": {"replied", "no_reply", "delivery_failed", "uncertain"},
+        }
+        if record is None or state not in transitions.get(record.state, set()):
+            raise JobStateError("diagnostic state transition is not allowed")
+        has_callback = digest is not None or completed_at is not None
+        if state in {"replied", "no_reply"} or (state == "delivery_failed" and has_callback):
+            if (
+                not isinstance(digest, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                or not isinstance(completed_at, str)
+                or (state == "replied" and (not isinstance(reply, str) or not reply))
+                or (state != "replied" and reply is not None)
+            ):
+                raise JobStateError("diagnostic callback identity is incomplete")
+        elif any(value is not None for value in (digest, reply, completed_at)):
+            raise JobStateError("non-reply diagnostic state cannot include callback data")
+        with self._connection:
+            result = self._connection.execute(
+                """UPDATE worker_diagnostics
+                   SET state=?, updated_at=?, callback_body_sha256=?, reply=?, completed_at=?
+                   WHERE diagnostic_id=? AND state=?""",
+                (state, _now(), digest, reply, completed_at, diagnostic_id, record.state),
+            )
+            if result.rowcount != 1:
+                raise JobStateError("diagnostic state changed during transition")
+
     def record_callback_result(self, job_id: str, digest: str, reason: str) -> None:
         """Pin the callback body digest before a terminal callback transition."""
         if not re.fullmatch(r"[0-9a-f]{64}", digest) or reason not in ("ok", "error", "blocked"):
@@ -501,6 +699,11 @@ class JobStore:
             self._connection.executemany(
                 "UPDATE jobs SET state='uncertain', updated_at=? WHERE job_id=?",
                 ((_now(), job_id) for job_id in ids),
+            )
+            self._connection.execute(
+                """UPDATE worker_diagnostics SET state='uncertain', updated_at=?
+                   WHERE state IN ('queued', 'dispatching', 'dispatched')""",
+                (_now(),),
             )
         return ids
 

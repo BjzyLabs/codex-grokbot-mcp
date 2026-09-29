@@ -79,9 +79,12 @@ def test_protocol_status_is_minimal_and_restart_reconciles(tmp_path: Path) -> No
             tools = {tool.name for tool in (await client.list_tools()).tools}
             assert tools == {
                 "grokbot_status",
+                "grokbot_inspect_job",
                 "grokbot_active",
                 "grokbot_delegate",
                 "grokbot_result",
+                "grokbot_diagnose",
+                "grokbot_diagnostic_result",
             }
             found = (
                 await client.call_tool("grokbot_status", {"job_id": "job-123"})
@@ -94,10 +97,19 @@ def test_protocol_status_is_minimal_and_restart_reconciles(tmp_path: Path) -> No
             }
             assert "private source marker" not in str(found)
             assert str(tmp_path) not in str(found)
+            inspection = await client.call_tool("grokbot_inspect_job", {"job_id": "missing"})
+            assert inspection.structured_content == {
+                "job_id": "missing",
+                "state": "not_found",
+            }
             missing = (
                 await client.call_tool("grokbot_status", {"job_id": "missing"})
             ).structured_content
             assert missing == {"job_id": "missing", "state": "not_found"}
+            diagnostic = await client.call_tool(
+                "grokbot_diagnose", {"target_job_id": "1234abcd-1234-4123-8123-123456789abc"}
+            )
+            assert diagnostic.is_error is True
 
     asyncio.run(exercise())
     store.close()
@@ -187,14 +199,18 @@ def test_real_stdio_transport_serves_status(tmp_path: Path) -> None:
         params = StdioServerParameters(
             command=sys.executable,
             args=["-m", "codex_grokbot_mcp.server", "--config", str(config_file)],
+            env={"PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")},
         )
         async with Client(params) as client:
             names = {tool.name for tool in (await client.list_tools()).tools}
             assert names == {
                 "grokbot_status",
+                "grokbot_inspect_job",
                 "grokbot_active",
                 "grokbot_delegate",
                 "grokbot_result",
+                "grokbot_diagnose",
+                "grokbot_diagnostic_result",
             }
             result = (
                 await client.call_tool("grokbot_status", {"job_id": "job-123"})
