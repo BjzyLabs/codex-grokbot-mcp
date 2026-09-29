@@ -104,8 +104,14 @@ def test_diagnostic_serializes_on_chief_lease_and_releases_after_validated_callb
         assert owner == "codex-grokbot-mcp"
         now = datetime.now(UTC)
         return LeaseRecord(
-            worker, "active", owner, job_id, now, now + timedelta(seconds=30),
-            now + timedelta(minutes=45), 1,
+            worker,
+            "active",
+            owner,
+            job_id,
+            now,
+            now + timedelta(seconds=30),
+            now + timedelta(minutes=45),
+            1,
         )
 
     def renew(_store, worker, *, owner, job_id):
@@ -113,8 +119,14 @@ def test_diagnostic_serializes_on_chief_lease_and_releases_after_validated_callb
         assert worker == lease_worker
         now = datetime.now(UTC)
         return LeaseRecord(
-            worker, "active", owner, job_id, now, now + timedelta(minutes=5),
-            now + timedelta(minutes=45), 2,
+            worker,
+            "active",
+            owner,
+            job_id,
+            now,
+            now + timedelta(minutes=5),
+            now + timedelta(minutes=45),
+            2,
         )
 
     def release(_store, worker, *, owner, job_id):
@@ -122,6 +134,7 @@ def test_diagnostic_serializes_on_chief_lease_and_releases_after_validated_callb
         assert worker == lease_worker
         assert owner == "codex-grokbot-mcp"
         return LeaseRecord(worker, "available", None, None, None, None, None, 3)
+
     body = {
         "schema_version": "v3",
         "job_type": "worker_diagnostic",
@@ -203,8 +216,16 @@ def test_diagnostic_ambiguous_webhook_retains_chief_lease(tmp_path, monkeypatch)
         events.append(f"acquire:{worker}")
         assert _store.client.mount == "kvProd_v2"
         assert _store.lease_prefix == "GrokBot/Leases"
-        return LeaseRecord(worker, "active", owner, job_id, now, now + timedelta(minutes=5),
-                           now + timedelta(minutes=45), 1)
+        return LeaseRecord(
+            worker,
+            "active",
+            owner,
+            job_id,
+            now,
+            now + timedelta(minutes=5),
+            now + timedelta(minutes=45),
+            1,
+        )
 
     monkeypatch.setattr(VaultLeaseStore, "acquire", acquire)
     monkeypatch.setattr(
@@ -273,8 +294,16 @@ def test_missing_callback_is_uncertain_not_no_reply(tmp_path, monkeypatch) -> No
         events.append(f"acquire:{worker}")
         assert _store.client.mount == "kvProd_v2"
         assert _store.lease_prefix == "GrokBot/Leases"
-        return LeaseRecord(worker, "active", owner, job_id, now, now + timedelta(minutes=5),
-                           now + timedelta(minutes=45), 1)
+        return LeaseRecord(
+            worker,
+            "active",
+            owner,
+            job_id,
+            now,
+            now + timedelta(minutes=5),
+            now + timedelta(minutes=45),
+            1,
+        )
 
     def release(*_args, **_kwargs):
         events.append("release")
@@ -323,8 +352,16 @@ def test_diagnostic_release_uncertainty_keeps_journal_uncertain(tmp_path, monkey
 
     def acquire(_store, worker, *, owner, job_id):
         events.append(f"acquire:{worker}")
-        return LeaseRecord(worker, "active", owner, job_id, now, now + timedelta(minutes=5),
-                           now + timedelta(minutes=45), 1)
+        return LeaseRecord(
+            worker,
+            "active",
+            owner,
+            job_id,
+            now,
+            now + timedelta(minutes=5),
+            now + timedelta(minutes=45),
+            1,
+        )
 
     def release(_store, worker, *, owner, job_id):
         events.append(f"release:{worker}")
