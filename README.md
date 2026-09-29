@@ -28,7 +28,10 @@ python -m codex_grokbot_mcp.server --config /absolute/private/config.toml
 ```
 
 The server exposes `grokbot_status(job_id)`, `grokbot_active()`,
-`grokbot_delegate(...)`, and `grokbot_result(job_id)`. Startup marks interrupted
+`grokbot_delegate(...)`, `grokbot_result(job_id)`, `grokbot_diagnose(target_job_id)`,
+and `grokbot_diagnostic_result(job_id)`. Diagnostics ask a configured same-account
+Chief of Staff about an existing coding job. Replies are advisory; they do not
+change leases or coding-job state. Startup marks interrupted
 jobs uncertain in the private journal; worker availability is read from the
 configured Vault KV v2 CAS lease. An uncertain job requires reconciliation
 even if Vault currently reports an available lease. Vault errors fail the

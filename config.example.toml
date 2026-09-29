@@ -13,6 +13,7 @@ control_repository = "example-org/private-control"
 # Omit both inbox keys to keep coding on the control-repository draft PR.
 # result_inbox_base_url = "https://inbox.example.invalid"
 # result_inbox_secret_path = "grokbot/inbox/requestor"
+# The Vault KV v2 secret above must contain a requestor_token field.
 
 [workers.coder_a]
 webhook_secret_path = "grokbot/webhooks/coder-a"
@@ -20,6 +21,11 @@ app_secret_path = "grokbot/apps/coder-a"
 lease_prefix = "grokbot/leases"
 lease_worker = "coder-a"
 # job_types = ["coding"]
+# Diagnostics require all three fields below and an explicitly configured,
+# same-account Chief of Staff worker with x_query and worker_diagnostic types.
+# account_id = "account-a"
+# diagnostic_chief_worker_id = "chief_a"
+# diagnostic_target_bot = "devcoder"
 
 [workers.coder_b]
 webhook_secret_path = "grokbot/webhooks/coder-b"

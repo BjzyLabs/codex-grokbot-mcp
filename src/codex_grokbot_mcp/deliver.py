@@ -23,7 +23,8 @@ _SOURCE_MAX = 512
 _SOURCES_MAX = 32
 _ERROR_MAX = 300
 _CREDENTIAL_RE = re.compile(
-    r"(?i)(?:-----BEGIN [A-Z ]*PRIVATE KEY-----|ghp_[A-Za-z0-9]{20,}|github_pat_|"
+    r"(?i)(?:-----BEGIN [A-Z ]*PRIVATE KEY-----|gh(?:p|s|u|o|r)_[A-Za-z0-9]{20,}|github_pat_|"
+    r"crsr_[A-Za-z0-9_-]{16,}|"
     r"\b(?:bearer|token|secret|password)\b\s*[:=]\s*\S+)"
 )
 _X_WRITE_CLAIM_RE = re.compile(
@@ -151,6 +152,104 @@ def build_x_query_packet(
     if len(raw) > MAX_WEBHOOK_BYTES:
         raise PacketError("coding packet exceeds webhook size limit")
     return packet
+
+
+def build_worker_diagnostic_packet(
+    *,
+    job_id: str,
+    target_job_id: str,
+    target_bot: str,
+    origin: str,
+    callback_token: str,
+) -> dict:
+    """Build a read-only Bot-to-Bot status question with callback-only authority."""
+    diagnostic_id = _canonical_job_id(job_id)
+    target_id = _canonical_job_id(target_job_id)
+    if target_bot not in ("coder", "devcoder"):
+        raise PacketError("diagnostic target Bot is invalid")
+    packet = {
+        "schema_version": "v3",
+        "job_type": "worker_diagnostic",
+        "job_id": diagnostic_id,
+        "target_job_id": target_id,
+        "target_bot": target_bot,
+        "goal": (
+            f"Message {target_bot} and ask whether coding job {target_id} is still working, "
+            "stopped, or finished. Do not start, stop, retry, or change any job, files, or "
+            "GitHub PRs. Never forward callback credentials."
+        ),
+        "constraints": {
+            "read_only": True,
+            "no_job_changes": True,
+            "no_credentials": True,
+            "no_secrets": True,
+        },
+        "context": {
+            "callback_url": callback_url(origin, diagnostic_id, "result"),
+            "callback_token": _token(callback_token),
+        },
+        "deliver": "callback",
+        "max_wait_seconds": 120,
+    }
+    raw = json.dumps(packet, separators=(",", ":")).encode("utf-8")
+    if len(raw) > MAX_WEBHOOK_BYTES:
+        raise PacketError("diagnostic packet exceeds webhook size limit")
+    return packet
+
+
+def validate_worker_diagnostic_result(
+    job_id: str,
+    target_job_id: str,
+    target_bot: str,
+    body: Any,
+    *,
+    now: datetime,
+    forbidden_values: tuple[str, ...] = (),
+) -> dict:
+    """Validate the exact callback envelope; replies remain advisory evidence."""
+    diagnostic_id = _canonical_job_id(job_id)
+    target_id = _canonical_job_id(target_job_id)
+    if target_bot not in ("coder", "devcoder") or not isinstance(body, dict):
+        raise PacketError("diagnostic callback is invalid")
+    fields = {
+        "schema_version",
+        "job_type",
+        "job_id",
+        "target_job_id",
+        "target_bot",
+        "status",
+        "reply",
+        "completed_at",
+        "read_only_attestation",
+    }
+    if set(body) != fields:
+        raise PacketError("diagnostic callback fields are invalid")
+    if (
+        body["schema_version"] != "v3"
+        or body["job_type"] != "worker_diagnostic"
+        or body["job_id"] != diagnostic_id
+        or body["target_job_id"] != target_id
+        or body["target_bot"] != target_bot
+        or body["read_only_attestation"] is not True
+    ):
+        raise PacketError("diagnostic callback identity does not match")
+    if not isinstance(body["completed_at"], str) or not body["completed_at"].endswith("Z"):
+        raise PacketError("diagnostic completion time must use UTC Z notation")
+    completed = _utc(body["completed_at"], "diagnostic completion time")
+    if completed > now.astimezone(UTC):
+        raise PacketError("diagnostic completion time is in the future")
+    status = body["status"]
+    reply = body["reply"]
+    if status == "replied":
+        _safe_text(reply, "diagnostic reply", 2000)
+        if any(value and value in reply for value in forbidden_values):
+            raise PacketError("diagnostic reply contains a request credential")
+    elif status in ("no_reply", "delivery_failed"):
+        if reply is not None:
+            raise PacketError("empty diagnostic status must not include a reply")
+    else:
+        raise PacketError("diagnostic status is invalid")
+    return body
 
 
 def build_v3_coding_packet(

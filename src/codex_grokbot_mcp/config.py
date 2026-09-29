@@ -30,9 +30,14 @@ TOP_KEYS = {
 }
 OPTIONAL_TOP_KEYS = {"result_inbox_base_url", "result_inbox_secret_path"}
 WORKER_KEYS = {"webhook_secret_path", "app_secret_path", "lease_prefix", "lease_worker"}
-OPTIONAL_WORKER_KEYS = {"job_types"}
+OPTIONAL_WORKER_KEYS = {
+    "job_types",
+    "account_id",
+    "diagnostic_chief_worker_id",
+    "diagnostic_target_bot",
+}
 WORKSPACE_KEYS = {"enabled", "workers"}
-JOB_TYPES = {"coding", "x_query"}
+JOB_TYPES = {"coding", "x_query", "worker_diagnostic"}
 COMPONENT = re.compile(r"[A-Za-z0-9_.-]+\Z")
 NESTED_PATH = re.compile(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\Z")
 
@@ -126,6 +131,9 @@ class WorkerConfig:
     lease_prefix: str
     lease_worker: str
     job_types: frozenset[str] = frozenset({"coding"})
+    account_id: str | None = None
+    diagnostic_chief_worker_id: str | None = None
+    diagnostic_target_bot: str | None = None
 
 
 @dataclass(frozen=True)
@@ -194,7 +202,25 @@ class Config:
                 _component(item["lease_prefix"], nested=True),
                 _component(item["lease_worker"]),
                 _job_types(item.get("job_types", ["coding"])),
+                _component(item["account_id"]) if "account_id" in item else None,
+                (
+                    _component(item["diagnostic_chief_worker_id"])
+                    if "diagnostic_chief_worker_id" in item
+                    else None
+                ),
+                item.get("diagnostic_target_bot"),
             )
+            if worker.diagnostic_target_bot not in (None, "coder", "devcoder"):
+                raise ConfigError("diagnostic target Bot is invalid")
+            if (
+                worker.diagnostic_chief_worker_id is not None
+                or worker.diagnostic_target_bot is not None
+            ) and (
+                worker.account_id is None
+                or worker.diagnostic_chief_worker_id is None
+                or worker.diagnostic_target_bot is None
+            ):
+                raise ConfigError("diagnostic routing configuration is incomplete")
             lease_key = (worker.lease_prefix, worker.lease_worker)
             if lease_key in lease_keys:
                 raise ConfigError("two workers cannot share a lease key")
@@ -258,3 +284,24 @@ class Config:
         if worker is None or job_type not in worker.job_types:
             raise ConfigError("worker cannot accept this job type")
         return worker
+
+    def require_diagnostic_route(self, target_worker_id: str) -> tuple[WorkerConfig, str]:
+        """Resolve an operator-declared same-account CoS and target Bot mapping."""
+        target = self.workers.get(target_worker_id)
+        if (
+            target is None
+            or target.account_id is None
+            or target.diagnostic_chief_worker_id is None
+            or target.diagnostic_target_bot is None
+        ):
+            raise ConfigError("diagnostic routing is not configured for the target worker")
+        chief = self.workers.get(target.diagnostic_chief_worker_id)
+        if (
+            chief is None
+            or chief.account_id is None
+            or chief.account_id != target.account_id
+            or "x_query" not in chief.job_types
+            or "worker_diagnostic" not in chief.job_types
+        ):
+            raise ConfigError("configured Chief of Staff account mapping is invalid")
+        return chief, target.diagnostic_target_bot
