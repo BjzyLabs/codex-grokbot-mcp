@@ -13,6 +13,7 @@ from codex_grokbot_mcp.config import WorkerConfig
 from codex_grokbot_mcp.control import GitHubControl, VaultClient, WebhookTransport
 from codex_grokbot_mcp.coordinator import Coordinator, CoordinatorError
 from codex_grokbot_mcp.jobs import JobStore
+from codex_grokbot_mcp.vault import LeaseRecord, LeaseUncertain, VaultLeaseStore
 
 TARGET_JOB_ID = "1234abcd-1234-4123-8123-123456789abc"
 
@@ -22,10 +23,13 @@ class FakeInbox:
         self.payload = None
         self.callback = callback
         self.events: list[str] = []
+        self.trace: list[str] | None = None
         self.deadline = None
 
     def register(self, job_id, kind, digest, deadline) -> None:
         self.events.append("register")
+        if self.trace is not None:
+            self.trace.append("register")
         assert kind == "result"
         assert len(digest) == 64
         assert deadline > datetime.now(UTC)
@@ -33,6 +37,8 @@ class FakeInbox:
 
     def fetch(self, job_id, kind):
         self.events.append("fetch")
+        if self.trace is not None:
+            self.trace.append("fetch")
         return self.payload if self.callback else None
 
 
@@ -53,8 +59,8 @@ def _account_routing(config) -> None:
         "chief",
         "webhook/chief",
         "app/chief",
-        "leases",
-        "shared-chief",
+        "GrokBot/Leases",
+        "chief-of-staff-supergrok",
         frozenset({"x_query", "worker_diagnostic"}),
         "test-account",
     )
@@ -77,7 +83,7 @@ def _create_target(store: JobStore, root) -> None:
     )
 
 
-def test_diagnostic_dispatches_without_coding_lease_or_github_token(
+def test_diagnostic_serializes_on_chief_lease_and_releases_after_validated_callback(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = workspace(tmp_path)
@@ -87,6 +93,35 @@ def test_diagnostic_dispatches_without_coding_lease_or_github_token(
     _create_target(store, root)
     inbox = FakeInbox()
     events: list[str] = []
+    inbox.trace = events
+    lease_worker = "chief-of-staff-supergrok"
+
+    def acquire(_store, worker, *, owner, job_id):
+        events.append("acquire")
+        assert worker == lease_worker
+        assert _store.client.mount == "kvProd_v2"
+        assert _store.lease_prefix == "GrokBot/Leases"
+        assert owner == "codex-grokbot-mcp"
+        now = datetime.now(UTC)
+        return LeaseRecord(
+            worker, "active", owner, job_id, now, now + timedelta(seconds=30),
+            now + timedelta(minutes=45), 1,
+        )
+
+    def renew(_store, worker, *, owner, job_id):
+        events.append("renew")
+        assert worker == lease_worker
+        now = datetime.now(UTC)
+        return LeaseRecord(
+            worker, "active", owner, job_id, now, now + timedelta(minutes=5),
+            now + timedelta(minutes=45), 2,
+        )
+
+    def release(_store, worker, *, owner, job_id):
+        events.append("release")
+        assert worker == lease_worker
+        assert owner == "codex-grokbot-mcp"
+        return LeaseRecord(worker, "available", None, None, None, None, None, 3)
     body = {
         "schema_version": "v3",
         "job_type": "worker_diagnostic",
@@ -120,8 +155,11 @@ def test_diagnostic_dispatches_without_coding_lease_or_github_token(
         }
 
     def forbidden(*_args, **_kwargs):
-        pytest.fail("diagnostic must not acquire a coding lease or mint a GitHub token")
+        pytest.fail("diagnostic must not mint a GitHub token")
 
+    monkeypatch.setattr(VaultLeaseStore, "acquire", acquire)
+    monkeypatch.setattr(VaultLeaseStore, "renew", renew)
+    monkeypatch.setattr(VaultLeaseStore, "release", release)
     monkeypatch.setattr(VaultClient, "read_secret", read_secret)
     monkeypatch.setattr(WebhookTransport, "dispatch", dispatch)
     monkeypatch.setattr(GitHubControl, "mint_worker_token", forbidden)
@@ -143,8 +181,65 @@ def test_diagnostic_dispatches_without_coding_lease_or_github_token(
     assert result.reply == "Finished; draft PR 139 is open."
     assert "register" in inbox.events
     assert timedelta(seconds=205) < inbox.deadline - started_at < timedelta(seconds=212)
-    assert events == ["secret:webhook/chief", "dispatch"]
+    assert events.index("acquire") < events.index("register") < events.index("dispatch")
+    assert events.index("dispatch") < events.index("renew") < events.index("release")
+    assert events[0] == "acquire"
+    assert events[-1] == "release"
+    assert inbox.events[0] == "register"
     assert store.get(TARGET_JOB_ID).state == "queued"
+    store.close()
+
+
+def test_diagnostic_ambiguous_webhook_retains_chief_lease(tmp_path, monkeypatch) -> None:
+    root = workspace(tmp_path)
+    config = configuration(tmp_path, root)
+    _account_routing(config)
+    store = JobStore.open(config.job_database)
+    _create_target(store, root)
+    events: list[str] = []
+    now = datetime.now(UTC)
+
+    def acquire(_store, worker, *, owner, job_id):
+        events.append(f"acquire:{worker}")
+        assert _store.client.mount == "kvProd_v2"
+        assert _store.lease_prefix == "GrokBot/Leases"
+        return LeaseRecord(worker, "active", owner, job_id, now, now + timedelta(minutes=5),
+                           now + timedelta(minutes=45), 1)
+
+    monkeypatch.setattr(VaultLeaseStore, "acquire", acquire)
+    monkeypatch.setattr(
+        VaultClient,
+        "read_secret",
+        lambda _vault, _path: {
+            "webhook_url": "https://chief.example.invalid/hook",
+            "sender_key": "sender",
+        },
+    )
+
+    def uncertain_dispatch(_webhook, _packet):
+        events.append("dispatch")
+        raise coordinator_module.WebhookUncertain("lost response")
+
+    monkeypatch.setattr(WebhookTransport, "dispatch", uncertain_dispatch)
+    monkeypatch.setattr(
+        VaultLeaseStore,
+        "release",
+        lambda *_args, **_kwargs: events.append("release"),
+    )
+
+    async def exercise():
+        coordinator = Coordinator(config, store, poll_seconds=0.01, inbox=FakeInbox())
+        submitted = await coordinator.diagnose(TARGET_JOB_ID)
+        for _ in range(100):
+            result = store.get_diagnostic(submitted["job_id"])
+            if result.state == "uncertain":
+                return result
+            await asyncio.sleep(0.01)
+        raise AssertionError("diagnostic did not settle")
+
+    result = asyncio.run(exercise())
+    assert result.state == "uncertain"
+    assert events == ["acquire:chief-of-staff-supergrok", "dispatch"]
     store.close()
 
 
@@ -171,6 +266,22 @@ def test_missing_callback_is_uncertain_not_no_reply(tmp_path, monkeypatch) -> No
     store = JobStore.open(config.job_database)
     _create_target(store, root)
     inbox = FakeInbox(callback=False)
+    events: list[str] = []
+    now = datetime.now(UTC)
+
+    def acquire(_store, worker, *, owner, job_id):
+        events.append(f"acquire:{worker}")
+        assert _store.client.mount == "kvProd_v2"
+        assert _store.lease_prefix == "GrokBot/Leases"
+        return LeaseRecord(worker, "active", owner, job_id, now, now + timedelta(minutes=5),
+                           now + timedelta(minutes=45), 1)
+
+    def release(*_args, **_kwargs):
+        events.append("release")
+        return LeaseRecord("chief-of-staff-supergrok", "available", None, None, None, None, None, 2)
+
+    monkeypatch.setattr(VaultLeaseStore, "acquire", acquire)
+    monkeypatch.setattr(VaultLeaseStore, "release", release)
     monkeypatch.setattr(coordinator_module, "DIAGNOSTIC_MAX_WAIT_SECONDS", 0)
     monkeypatch.setattr(coordinator_module, "DIAGNOSTIC_CALLBACK_GRACE_SECONDS", 0.05)
     monkeypatch.setattr(
@@ -196,6 +307,75 @@ def test_missing_callback_is_uncertain_not_no_reply(tmp_path, monkeypatch) -> No
     result = asyncio.run(exercise())
     assert result.state == "uncertain"
     assert result.callback_body_sha256 is None
+    assert events == ["acquire:chief-of-staff-supergrok"]
+    store.close()
+
+
+def test_diagnostic_release_uncertainty_keeps_journal_uncertain(tmp_path, monkeypatch) -> None:
+    root = workspace(tmp_path)
+    config = configuration(tmp_path, root)
+    _account_routing(config)
+    store = JobStore.open(config.job_database)
+    _create_target(store, root)
+    inbox = FakeInbox()
+    events: list[str] = []
+    now = datetime.now(UTC)
+
+    def acquire(_store, worker, *, owner, job_id):
+        events.append(f"acquire:{worker}")
+        return LeaseRecord(worker, "active", owner, job_id, now, now + timedelta(minutes=5),
+                           now + timedelta(minutes=45), 1)
+
+    def release(_store, worker, *, owner, job_id):
+        events.append(f"release:{worker}")
+        raise LeaseUncertain("release readback is ambiguous")
+
+    body = {
+        "schema_version": "v3",
+        "job_type": "worker_diagnostic",
+        "job_id": "",
+        "target_job_id": TARGET_JOB_ID,
+        "target_bot": "devcoder",
+        "status": "replied",
+        "reply": "Finished.",
+        "completed_at": (now - timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
+        "read_only_attestation": True,
+    }
+
+    def dispatch(_webhook, packet):
+        body["job_id"] = packet["job_id"]
+        encoded = json.dumps(body, separators=(",", ":")).encode()
+        inbox.payload = {
+            "stored": True,
+            "body": body,
+            "body_sha256": hashlib.sha256(encoded).hexdigest(),
+        }
+
+    monkeypatch.setattr(VaultLeaseStore, "acquire", acquire)
+    monkeypatch.setattr(VaultLeaseStore, "release", release)
+    monkeypatch.setattr(
+        VaultClient,
+        "read_secret",
+        lambda _vault, _path: {
+            "webhook_url": "https://chief.example.invalid/hook",
+            "sender_key": "sender",
+        },
+    )
+    monkeypatch.setattr(WebhookTransport, "dispatch", dispatch)
+
+    async def exercise():
+        coordinator = Coordinator(config, store, poll_seconds=0.01, inbox=inbox)
+        submitted = await coordinator.diagnose(TARGET_JOB_ID)
+        for _ in range(100):
+            result = store.get_diagnostic(submitted["job_id"])
+            if result.state == "uncertain":
+                return result
+            await asyncio.sleep(0.01)
+        raise AssertionError("diagnostic release uncertainty did not settle")
+
+    result = asyncio.run(exercise())
+    assert result.state == "uncertain"
+    assert events == ["acquire:chief-of-staff-supergrok", "release:chief-of-staff-supergrok"]
     store.close()
 
 

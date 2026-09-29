@@ -170,6 +170,35 @@ def test_diagnostic_route_rejects_cross_account_or_missing_receiver(paths, tmp_p
         config.require_diagnostic_route("coder")
 
 
+def test_x_query_worker_must_be_mapped_same_account_chief(paths, tmp_path: Path) -> None:
+    workspace, ca = paths
+    config = Config.load(write_config(tmp_path, diagnostic_config_text(workspace, ca)))
+    chief = config.require_x_query_worker("chief")
+    assert chief.worker_id == "chief"
+
+    with pytest.raises(ConfigError, match="Chief of Staff"):
+        config.require_x_query_worker("coder")
+
+
+def test_x_query_worker_rejects_unmapped_or_cross_account_chief(paths, tmp_path: Path) -> None:
+    workspace, ca = paths
+    config = Config.load(write_config(tmp_path, diagnostic_config_text(workspace, ca)))
+    with pytest.raises(ConfigError, match="Chief of Staff"):
+        config.require_x_query_worker("reviewer")
+
+    config.workers["chief"] = config.workers["chief"].__class__(
+        "chief",
+        "webhooks/chief",
+        "github/chief",
+        "leases",
+        "chief",
+        frozenset({"x_query", "worker_diagnostic"}),
+        "account-b",
+    )
+    with pytest.raises(ConfigError, match="account mapping"):
+        config.require_x_query_worker("chief")
+
+
 def test_partial_diagnostic_route_is_rejected(paths, tmp_path: Path) -> None:
     workspace, ca = paths
     source = config_text(workspace, ca).replace(

@@ -58,7 +58,7 @@ def configuration(tmp_path: Path, root: Path, *, opted_in: bool = True) -> Confi
     ca.write_text("synthetic CA fixture\n")
     return Config(
         "https://vault.example.invalid",
-        "kv",
+        "kvProd_v2",
         tmp_path / "role",
         tmp_path / "secret",
         ca,
@@ -74,6 +74,8 @@ def configuration(tmp_path: Path, root: Path, *, opted_in: bool = True) -> Confi
 class FakeServices:
     def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self.events: list[str] = []
+        self.lease_workers: list[str] = []
+        self.released_workers: list[str] = []
         self.packet: dict | None = None
         self.artifact: dict | None = None
         self.webhook_error: Exception | None = None
@@ -130,7 +132,11 @@ class FakeServices:
 
     def acquire(self, _store, worker: str, *, owner: str, job_id: str) -> LeaseRecord:
         self.events.append("acquire")
-        assert worker == "shared-a"
+        assert worker in {"shared-a", "chief-of-staff-supergrok"}
+        if worker == "chief-of-staff-supergrok":
+            assert _store.client.mount == "kvProd_v2"
+            assert _store.lease_prefix == "GrokBot/Leases"
+        self.lease_workers.append(worker)
         if self.lease_error:
             raise self.lease_error
         now = datetime.now(UTC)
@@ -165,6 +171,7 @@ class FakeServices:
 
     def release(self, _store, worker: str, *, owner: str, job_id: str) -> LeaseRecord:
         self.events.append("release")
+        self.released_workers.append(worker)
         return LeaseRecord(worker, "available", None, None, None, None, None, 3)
 
     def mint(self, _control) -> InstallationToken:
