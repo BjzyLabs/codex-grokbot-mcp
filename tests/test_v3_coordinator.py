@@ -9,7 +9,7 @@ import pytest
 from test_coordinator import FakeServices, configuration, settled, workspace
 
 from codex_grokbot_mcp.config import WorkerConfig
-from codex_grokbot_mcp.control import ControlError, WebhookUncertain, WebhookTransport
+from codex_grokbot_mcp.control import ControlError, WebhookTransport, WebhookUncertain
 from codex_grokbot_mcp.coordinator import Coordinator, CoordinatorError
 from codex_grokbot_mcp.jobs import JobStore
 from codex_grokbot_mcp.vault import LeaseUncertain
