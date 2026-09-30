@@ -1,28 +1,26 @@
-# Workers and task size
+# The single configured Bot
 
-Each configured Grok Bot worker has an explicit worker ID, webhook credential
-path, GitHub App credential path, and Vault KV v2 CAS lease key. Adding a worker
-requires those exact resources and a tested route. A busy or failed worker does
-not trigger automatic routing to another Bot. Every dispatcher that can reach
-the same Bot must claim the same lease key before dispatch.
+This requestor talks to exactly one Grok Bot: the Chief of Staff behind the
+configured webhook. That identity is fixed in the configuration by its webhook
+URL and sender key; there is no worker table, no worker selection, and no
+fallback to another Bot. Cancelling a different account or Bot does not affect
+this path.
 
-Cursor [documents concurrent Bots](https://cursor.com/docs/grok-bot), but Bots
-under one account share a cloud computer, files, browser sessions, and app
-logins. A per-Bot lease prevents overlapping jobs for that Bot; it does not
-isolate one Bot's data from another on the shared computer. Operators must
-approve every Bot's access to delegated source and keep control-repository
-branches and artifacts unique to the job. Worker count is not a security
-boundary.
+Two request types are supported, both read-only:
 
-A delegated job should state its goal, the exact source snapshots, allowed
-write paths, acceptance checks, and the 45-minute maximum. Larger work should
-be split into bounded jobs before submission. A task-size or effort estimate
-may help the Bot plan its response, but it is advisory and never relaxes path,
-lease, deadline, or review checks.
+- `x_query` for public X research, where access to X is the reason to ask;
+- `ask` for any other bounded question with the same quick turnaround.
 
-Grok Bot's [settings documentation](https://cursor.com/docs/grok-bot/settings)
-says Cursor manages its model selection and provides no model picker. This
-integration therefore makes no per-job model promise. Cursor Cloud Agents and
-Automations have separate model controls; those APIs are outside this Grok Bot
-webhook contract. A future model-aware route would require documented Grok Bot
-support and a revised plan.
+Because both are read-only, requests may overlap. The Bot serialises them in
+its own conversation; the requestor does not need mutual exclusion, and a
+second question cannot corrupt the first because each answer arrives on its own
+per-job callback path.
+
+There is nothing to size, lease, or queue locally. A question should still be
+bounded: it must fit 2000 characters, and the job has 45 minutes to answer
+before the requestor marks it `uncertain`.
+
+Planned repository missions (review-only work across the GitHub organisation)
+are a later phase and are not part of this contract. They would need their own
+authority model, because flagging issues and reviewing code are not read-only
+answers.

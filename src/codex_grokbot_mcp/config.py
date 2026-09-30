@@ -1,87 +1,42 @@
-"""Strict local configuration for Vault-only workers and workspace opt-in."""
+"""Strict owner-only configuration for the one Grok Bot webhook requestor."""
 
 from __future__ import annotations
 
 import os
-import re
 import stat
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
-from .control import REPO_PATTERN
 from .deliver import PacketError, canonical_inbox_origin
-from .vault import VaultClient, VaultError
 
-TOP_KEYS = {
-    "version",
-    "vault_address",
-    "vault_mount",
-    "vault_role_id_file",
-    "vault_secret_id_file",
-    "vault_ca_file",
-    "github_ca_file",
-    "webhook_ca_file",
-    "job_database",
-    "control_repository",
-    "workers",
-    "workspaces",
-}
-OPTIONAL_TOP_KEYS = {"result_inbox_base_url", "result_inbox_secret_path"}
-WORKER_KEYS = {"webhook_secret_path", "app_secret_path", "lease_prefix", "lease_worker"}
-OPTIONAL_WORKER_KEYS = {
-    "job_types",
-    "account_id",
-    "diagnostic_chief_worker_id",
-    "diagnostic_target_bot",
-}
-WORKSPACE_KEYS = {"enabled", "workers"}
-JOB_TYPES = {"coding", "x_query", "worker_diagnostic"}
-COMPONENT = re.compile(r"[A-Za-z0-9_.-]+\Z")
-NESTED_PATH = re.compile(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\Z")
+CURRENT_VERSION = 2
+CONFIG_KEYS = frozenset(
+    {
+        "version",
+        "job_database",
+        "inbox_base_url",
+        "inbox_requestor_token",
+        "webhook_url",
+        "sender_key",
+    }
+)
 
 
 class ConfigError(ValueError):
-    """Configuration is missing, unsafe, or grants ambiguous authority."""
-
-
-def _keys(
-    value: Any,
-    allowed: set[str],
-    *,
-    label: str,
-    optional: set[str] | None = None,
-) -> dict:
-    optional = set() if optional is None else optional
-    if not isinstance(value, dict) or not allowed <= set(value) <= allowed | optional:
-        raise ConfigError(f"{label} has missing or unknown fields")
-    return value
-
-
-def _component(value: Any, *, nested: bool = False) -> str:
-    pattern = NESTED_PATH if nested else COMPONENT
-    if (
-        not isinstance(value, str)
-        or not pattern.fullmatch(value)
-        or any(part in (".", "..") for part in value.split("/"))
-    ):
-        raise ConfigError("Vault path or worker identifier is invalid")
-    return value
-
-
-def _absolute_path(value: Any, *, label: str) -> Path:
-    if not isinstance(value, str) or not value or not Path(value).is_absolute():
-        raise ConfigError(f"{label} must be an absolute path")
-    return Path(value)
+    """Configuration is missing, unsafe, or unsupported."""
 
 
 def _private_file(value: Any, *, label: str) -> Path:
-    path = _absolute_path(value, label=label)
+    if not isinstance(value, str) or not value or not Path(value).is_absolute():
+        raise ConfigError(f"{label} must be an absolute path")
+    path = Path(value)
     try:
         details = path.lstat()
     except OSError as error:
-        raise ConfigError(f"{label} credential or config file is unavailable") from error
+        raise ConfigError(f"{label} is unavailable") from error
     if (
         not stat.S_ISREG(details.st_mode)
         or details.st_uid != os.getuid()
@@ -91,72 +46,53 @@ def _private_file(value: Any, *, label: str) -> Path:
     return path
 
 
-def _ca_file(value: Any, *, label: str) -> Path:
-    path = _absolute_path(value, label=label)
-    if not path.is_file():
-        raise ConfigError(f"{label} CA bundle is unavailable")
-    return path
+def _absolute_path(value: Any, *, label: str) -> Path:
+    if not isinstance(value, str) or not value or not Path(value).is_absolute():
+        raise ConfigError(f"{label} must be an absolute path")
+    return Path(value)
 
 
-def _job_types(value: Any) -> frozenset[str]:
+def _secret(value: Any, *, label: str) -> str:
     if (
-        not isinstance(value, list)
+        not isinstance(value, str)
         or not value
-        or any(not isinstance(item, str) or item not in JOB_TYPES for item in value)
-        or len(value) != len(set(value))
+        or any(character.isspace() or ord(character) < 32 for character in value)
     ):
-        raise ConfigError("worker job types are invalid")
-    return frozenset(value)
+        raise ConfigError(f"{label} is missing or unsafe")
+    return value
 
 
-def _inbox(source: dict) -> tuple[str | None, str | None]:
-    url = source.get("result_inbox_base_url")
-    secret = source.get("result_inbox_secret_path")
-    if url is None and secret is None:
-        return None, None
-    if not isinstance(url, str) or not isinstance(secret, str):
-        raise ConfigError("result inbox configuration is incomplete")
+def _inbox_origin(value: Any) -> str:
     try:
-        origin = canonical_inbox_origin(url)
+        return canonical_inbox_origin(value)
     except PacketError as error:
-        raise ConfigError("result inbox origin is invalid") from error
-    return origin, _component(secret, nested=True)
+        raise ConfigError("callback inbox origin is invalid") from error
 
 
-@dataclass(frozen=True)
-class WorkerConfig:
-    worker_id: str
-    webhook_secret_path: str
-    app_secret_path: str
-    lease_prefix: str
-    lease_worker: str
-    job_types: frozenset[str] = frozenset({"coding"})
-    account_id: str | None = None
-    diagnostic_chief_worker_id: str | None = None
-    diagnostic_target_bot: str | None = None
-
-
-@dataclass(frozen=True)
-class WorkspaceRule:
-    enabled: bool
-    workers: frozenset[str]
+def _webhook_url(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ConfigError("webhook URL is invalid")
+    parts = urlsplit(value)
+    if (
+        parts.scheme != "https"
+        or not parts.hostname
+        or parts.username is not None
+        or parts.password is not None
+        or parts.fragment
+    ):
+        raise ConfigError("webhook URL must be HTTPS without embedded credentials")
+    return value
 
 
 @dataclass(frozen=True)
 class Config:
-    vault_address: str
-    vault_mount: str
-    vault_role_id_file: Path
-    vault_secret_id_file: Path
-    vault_ca_file: Path
-    github_ca_file: Path
-    webhook_ca_file: Path
+    """Everything one requestor needs; the two secrets never appear in repr()."""
+
     job_database: Path
-    control_repository: str
-    workers: dict[str, WorkerConfig]
-    workspaces: dict[Path, WorkspaceRule]
-    result_inbox_base_url: str | None = None
-    result_inbox_secret_path: str | None = None
+    inbox_base_url: str
+    webhook_url: str
+    inbox_requestor_token: str = field(repr=False)
+    sender_key: str = field(repr=False)
 
     @classmethod
     def load(cls, path: Path) -> Config:
@@ -166,157 +102,16 @@ class Config:
                 source = tomllib.load(handle)
         except (OSError, tomllib.TOMLDecodeError) as error:
             raise ConfigError("configuration TOML cannot be read") from error
-        _keys(source, TOP_KEYS, label="configuration", optional=OPTIONAL_TOP_KEYS)
-        if type(source["version"]) is not int or source["version"] != 1:
+        if not isinstance(source, dict) or set(source) != CONFIG_KEYS:
+            raise ConfigError("configuration has missing or unknown fields")
+        if type(source["version"]) is not int or source["version"] != CURRENT_VERSION:
             raise ConfigError("configuration version is unsupported")
-        mount = _component(source["vault_mount"])
-        role = _private_file(source["vault_role_id_file"], label="AppRole role ID credential")
-        secret = _private_file(source["vault_secret_id_file"], label="AppRole SecretID credential")
-        vault_ca = _ca_file(source["vault_ca_file"], label="Vault")
-        github_ca = _ca_file(source["github_ca_file"], label="GitHub")
-        webhook_ca = _ca_file(source["webhook_ca_file"], label="webhook")
-        database = _absolute_path(source["job_database"], label="job database")
-        repository = source["control_repository"]
-        if (
-            not isinstance(repository, str)
-            or not REPO_PATTERN.fullmatch(repository)
-            or any(part in (".", "..") for part in repository.split("/"))
-        ):
-            raise ConfigError("control repository identity is invalid")
-        try:
-            client = VaultClient(source["vault_address"], role, secret, mount, vault_ca)
-        except (VaultError, TypeError) as error:
-            raise ConfigError("Vault connection configuration is invalid") from error
-        workers_data = source["workers"]
-        if not isinstance(workers_data, dict) or not workers_data:
-            raise ConfigError("at least one explicit worker is required")
-        workers: dict[str, WorkerConfig] = {}
-        lease_keys: set[tuple[str, str]] = set()
-        for worker_id, item in workers_data.items():
-            _component(worker_id)
-            _keys(item, WORKER_KEYS, label="worker", optional=OPTIONAL_WORKER_KEYS)
-            worker = WorkerConfig(
-                worker_id,
-                _component(item["webhook_secret_path"], nested=True),
-                _component(item["app_secret_path"], nested=True),
-                _component(item["lease_prefix"], nested=True),
-                _component(item["lease_worker"]),
-                _job_types(item.get("job_types", ["coding"])),
-                _component(item["account_id"]) if "account_id" in item else None,
-                (
-                    _component(item["diagnostic_chief_worker_id"])
-                    if "diagnostic_chief_worker_id" in item
-                    else None
-                ),
-                item.get("diagnostic_target_bot"),
-            )
-            if worker.diagnostic_target_bot not in (None, "coder", "devcoder"):
-                raise ConfigError("diagnostic target Bot is invalid")
-            if (
-                worker.diagnostic_chief_worker_id is not None
-                or worker.diagnostic_target_bot is not None
-            ) and (
-                worker.account_id is None
-                or worker.diagnostic_chief_worker_id is None
-                or worker.diagnostic_target_bot is None
-            ):
-                raise ConfigError("diagnostic routing configuration is incomplete")
-            lease_key = (worker.lease_prefix, worker.lease_worker)
-            if lease_key in lease_keys:
-                raise ConfigError("two workers cannot share a lease key")
-            lease_keys.add(lease_key)
-            workers[worker_id] = worker
-        workspace_data = source["workspaces"]
-        if not isinstance(workspace_data, dict):
-            raise ConfigError("workspace opt-in table is required")
-        workspaces: dict[Path, WorkspaceRule] = {}
-        for raw_root, item in workspace_data.items():
-            root = _absolute_path(raw_root, label="workspace")
-            if not root.is_dir() or root.resolve() != root:
-                raise ConfigError("workspace opt-in path must be an existing canonical directory")
-            _keys(item, WORKSPACE_KEYS, label="workspace")
-            enabled = item["enabled"]
-            allowed = item["workers"]
-            if type(enabled) is not bool or not isinstance(allowed, list) or not allowed:
-                raise ConfigError("workspace opt-in is incomplete")
-            if any(not isinstance(name, str) or name not in workers for name in allowed):
-                raise ConfigError("workspace references an unknown worker")
-            if len(allowed) != len(set(allowed)) or root in workspaces:
-                raise ConfigError("workspace worker grants are duplicated")
-            workspaces[root] = WorkspaceRule(enabled, frozenset(allowed))
-        inbox_url, inbox_secret = _inbox(source)
         return cls(
-            client.address,
-            mount,
-            role,
-            secret,
-            vault_ca,
-            github_ca,
-            webhook_ca,
-            database,
-            repository,
-            workers,
-            workspaces,
-            inbox_url,
-            inbox_secret,
+            job_database=_absolute_path(source["job_database"], label="job database"),
+            inbox_base_url=_inbox_origin(source["inbox_base_url"]),
+            webhook_url=_webhook_url(source["webhook_url"]),
+            inbox_requestor_token=_secret(
+                source["inbox_requestor_token"], label="callback inbox credential"
+            ),
+            sender_key=_secret(source["sender_key"], label="webhook sender key"),
         )
-
-    def vault_client(self) -> VaultClient:
-        return VaultClient(
-            self.vault_address,
-            self.vault_role_id_file,
-            self.vault_secret_id_file,
-            self.vault_mount,
-            self.vault_ca_file,
-        )
-
-    def require_workspace(self, root: Path, worker_id: str) -> WorkerConfig:
-        worker = self.workers.get(worker_id)
-        if worker is None:
-            raise ConfigError("worker is not configured")
-        rule = self.workspaces.get(Path(root).resolve())
-        if rule is None or not rule.enabled or worker_id not in rule.workers:
-            raise ConfigError("workspace opt-in is required for this worker")
-        return worker
-
-    def require_job_type(self, worker_id: str, job_type: str) -> WorkerConfig:
-        worker = self.workers.get(worker_id)
-        if worker is None or job_type not in worker.job_types:
-            raise ConfigError("worker cannot accept this job type")
-        return worker
-
-    def require_diagnostic_route(self, target_worker_id: str) -> tuple[WorkerConfig, str]:
-        """Resolve an operator-declared same-account CoS and target Bot mapping."""
-        target = self.workers.get(target_worker_id)
-        if (
-            target is None
-            or target.account_id is None
-            or target.diagnostic_chief_worker_id is None
-            or target.diagnostic_target_bot is None
-        ):
-            raise ConfigError("diagnostic routing is not configured for the target worker")
-        chief = self.workers.get(target.diagnostic_chief_worker_id)
-        if (
-            chief is None
-            or chief.account_id is None
-            or chief.account_id != target.account_id
-            or "x_query" not in chief.job_types
-            or "worker_diagnostic" not in chief.job_types
-        ):
-            raise ConfigError("configured Chief of Staff account mapping is invalid")
-        return chief, target.diagnostic_target_bot
-
-    def require_x_query_worker(self, worker_id: str) -> WorkerConfig:
-        """Allow X queries only on a same-account CoS mapped by a coding worker."""
-        chief = self.workers.get(worker_id)
-        if chief is None or "x_query" not in chief.job_types:
-            raise ConfigError("worker is not a configured Chief of Staff for x_query")
-        for target in self.workers.values():
-            if target.diagnostic_chief_worker_id != worker_id:
-                continue
-            if "coding" not in target.job_types:
-                raise ConfigError("Chief of Staff mapping target is not a coding worker")
-            mapped_chief, _target_bot = self.require_diagnostic_route(target.worker_id)
-            if mapped_chief.worker_id == worker_id:
-                return chief
-        raise ConfigError("worker is not mapped as a same-account Chief of Staff")

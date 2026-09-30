@@ -10,7 +10,6 @@ import ssl
 import threading
 import urllib.error
 import urllib.request
-from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -19,7 +18,7 @@ from urllib.parse import urlsplit
 from uuid import UUID
 
 from .deliver import CALLBACK_BODY_LIMIT, PacketError, canonical_inbox_origin
-from .vault import VaultClient
+from .tls import verified_context
 
 _JSON = b"application/json"
 
@@ -49,10 +48,8 @@ class InboxClient:
             raise InboxError("callback inbox credential is invalid")
         self._authorization = f"Bearer {requestor_token}"
         try:
-            context = ssl.create_default_context(cafile=ca_file) if ca_file else None
-            handlers = [_NoRedirect()]
-            if context is not None:
-                handlers.append(urllib.request.HTTPSHandler(context=context))
+            context = ssl.create_default_context(cafile=ca_file) if ca_file else verified_context()
+            handlers = [_NoRedirect(), urllib.request.HTTPSHandler(context=context)]
             self._opener = urllib.request.build_opener(*handlers)
         except (OSError, ssl.SSLError) as error:
             raise InboxError("callback inbox trust configuration is invalid") from error
@@ -133,43 +130,6 @@ class InboxClient:
         if not isinstance(body, dict):
             raise InboxError("callback inbox body is invalid")
         return {"stored": True, "body_sha256": body_hash, "body": body}
-
-
-class VaultInboxClient:
-    """Lazy Vault-backed requestor client using the existing configured secret path."""
-
-    def __init__(
-        self,
-        origin: str,
-        secret_path: str,
-        ca_file: str | None,
-        vault_factory: Callable[[], VaultClient],
-    ) -> None:
-        self.origin = origin
-        self.secret_path = secret_path
-        self.ca_file = ca_file
-        self.vault_factory = vault_factory
-        self._client: InboxClient | None = None
-        self._lock = threading.Lock()
-
-    def _get_client(self) -> InboxClient:
-        with self._lock:
-            if self._client is None:
-                try:
-                    secret = self.vault_factory().read_secret(self.secret_path)
-                except Exception as error:
-                    raise InboxError("callback inbox credential is unavailable") from error
-                token = secret.get("requestor_token")
-                if not isinstance(token, str):
-                    raise InboxError("callback inbox credential is unavailable")
-                self._client = InboxClient(self.origin, token, self.ca_file)
-            return self._client
-
-    def register(self, job_id: str, kind: str, digest: str, deadline: datetime) -> None:
-        self._get_client().register(job_id, kind, digest, deadline)
-
-    def fetch(self, job_id: str, kind: str) -> dict | None:
-        return self._get_client().fetch(job_id, kind)
 
 
 @dataclass

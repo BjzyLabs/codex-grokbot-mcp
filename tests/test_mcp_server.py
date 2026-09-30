@@ -1,244 +1,276 @@
 from __future__ import annotations
 
 import asyncio
-import os
-import subprocess
+import contextlib
 import sys
-from datetime import UTC, datetime, timedelta
+import tempfile
+import unittest
+from datetime import datetime
 from pathlib import Path
+from unittest import mock
 
 from mcp import Client, StdioServerParameters
+from support import (
+    CALLBACK_TOKEN,
+    JOB_ID,
+    OTHER_JOB_ID,
+    LocalInbox,
+    RecordingTransport,
+    config_text,
+    deadline,
+    make_config,
+    ok_body,
+    wait_until,
+    write_config_file,
+)
 
-from codex_grokbot_mcp.config import Config, WorkerConfig
+import codex_grokbot_mcp.coordinator as coordinator_module
+from codex_grokbot_mcp.inbox import token_hash
 from codex_grokbot_mcp.jobs import JobStore
-from codex_grokbot_mcp.local import Workspace
 from codex_grokbot_mcp.server import create_server
-from codex_grokbot_mcp.vault import LeaseRecord, VaultLeaseStore, VaultUnavailable
+
+TOOL_NAMES = {
+    "grokbot_x_query",
+    "grokbot_ask",
+    "grokbot_status",
+    "grokbot_result",
+    "grokbot_active",
+}
+SOURCE_ROOT = Path(__file__).resolve().parents[1] / "src"
 
 
-def git(repo: Path, *args: str) -> None:
-    subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, text=True)
+class ServerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temporary.cleanup)
+        self.root = Path(self._temporary.name)
+        private = self.root / "private"
+        private.mkdir(mode=0o700)
+        self.database = private / "jobs.sqlite3"
+        self.store = JobStore.open(self.database)
+        self.addCleanup(self.store.close)
+        self.inbox = LocalInbox()
+        self.config = make_config(self.root)
 
+    def state(self, job_id: str) -> str | None:
+        record = self.store.get(job_id)
+        return None if record is None else record.state
 
-def journal(tmp_path: Path) -> JobStore:
-    root = tmp_path / "source"
-    root.mkdir()
-    git(root, "init", "-q")
-    git(root, "remote", "add", "origin", "https://github.com/example/source.git")
-    (root / "module.py").write_text("private source marker\n")
-    git(root, "add", "module.py")
-    git(
-        root,
-        "-c",
-        "user.name=Test",
-        "-c",
-        "user.email=test@example.invalid",
-        "commit",
-        "-qm",
-        "base",
-    )
-    context = Workspace.open(root, opted_in=True).snapshot(
-        read_paths=["module.py"], write_paths=["module.py"]
-    )
-    store = JobStore.open(tmp_path / "private" / "jobs.sqlite3")
-    store.create(
-        "job-123",
-        "worker-a",
-        context,
-        lease_owner="test-owner",
-        control_branch="grokbot/job-coding-1234abcd",
-        artifact_path="artifacts/patch-1234abcd.json",
-    )
-    return store
+    @contextlib.contextmanager
+    def transport(self, recorder):
+        with mock.patch.object(coordinator_module, "WebhookTransport", new=recorder.factory):
+            yield recorder
 
+    def test_tool_surface_is_exactly_the_five_tools(self) -> None:
+        server = create_server(self.config, self.store, inbox=self.inbox)
 
-def configuration(tmp_path: Path) -> Config:
-    (tmp_path / "ca").write_text("synthetic CA placeholder\n")
-    return Config(
-        "https://vault.example.invalid:8200",
-        "kv",
-        tmp_path / "role",
-        tmp_path / "secret",
-        tmp_path / "ca",
-        tmp_path / "ca",
-        tmp_path / "ca",
-        tmp_path / "private" / "jobs.sqlite3",
-        "example/control",
-        {"worker-a": WorkerConfig("worker-a", "webhook/a", "app/a", "leases", "shared-a")},
-        {},
-    )
+        async def scenario():
+            async with Client(server) as client:
+                return {tool.name for tool in (await client.list_tools()).tools}
 
+        self.assertEqual(asyncio.run(scenario()), TOOL_NAMES)
 
-def test_protocol_status_is_minimal_and_restart_reconciles(tmp_path: Path) -> None:
-    store = journal(tmp_path)
-    store.advance("job-123", "lease_held")
-    config = configuration(tmp_path)
-
-    async def exercise() -> None:
-        async with Client(create_server(config, store), raise_exceptions=True) as client:
-            tools = {tool.name for tool in (await client.list_tools()).tools}
-            assert tools == {
-                "grokbot_status",
-                "grokbot_inspect_job",
-                "grokbot_active",
-                "grokbot_delegate",
-                "grokbot_result",
-                "grokbot_diagnose",
-                "grokbot_diagnostic_result",
-            }
-            found = (
-                await client.call_tool("grokbot_status", {"job_id": "job-123"})
-            ).structured_content
-            assert found == {
-                "job_id": "job-123",
-                "worker_id": "worker-a",
-                "state": "uncertain",
-                "updated_at": store.get("job-123").updated_at,
-            }
-            assert "private source marker" not in str(found)
-            assert str(tmp_path) not in str(found)
-            inspection = await client.call_tool("grokbot_inspect_job", {"job_id": "missing"})
-            assert inspection.structured_content == {
-                "job_id": "missing",
-                "state": "not_found",
-            }
-            missing = (
-                await client.call_tool("grokbot_status", {"job_id": "missing"})
-            ).structured_content
-            assert missing == {"job_id": "missing", "state": "not_found"}
-            diagnostic = await client.call_tool(
-                "grokbot_diagnose", {"target_job_id": "1234abcd-1234-4123-8123-123456789abc"}
-            )
-            assert diagnostic.is_error is True
-
-    asyncio.run(exercise())
-    store.close()
-
-
-def test_active_reports_vault_lease_and_local_uncertainty(tmp_path: Path, monkeypatch) -> None:
-    store = journal(tmp_path)
-    store.advance("job-123", "lease_held")
-    config = configuration(tmp_path)
-    now = datetime.now(UTC)
-    lease = LeaseRecord(
-        "shared-a",
-        "active",
-        "test-owner",
-        "job-123",
-        now,
-        now + timedelta(minutes=5),
-        now + timedelta(minutes=45),
-        1,
-    )
-    monkeypatch.setattr(VaultLeaseStore, "require_cas", lambda self, worker: None)
-    monkeypatch.setattr(VaultLeaseStore, "read", lambda self, worker: lease)
-
-    async def exercise() -> None:
-        async with Client(create_server(config, store), raise_exceptions=True) as client:
-            result = (await client.call_tool("grokbot_active")).structured_content
-            assert result == {
-                "workers": [{"worker_id": "worker-a", "state": "busy"}],
-                "jobs": [{"job_id": "job-123", "worker_id": "worker-a", "state": "uncertain"}],
-            }
-
-    asyncio.run(exercise())
-    store.close()
-
-
-def test_active_fails_closed_when_vault_is_unavailable(tmp_path: Path, monkeypatch) -> None:
-    store = journal(tmp_path)
-    config = configuration(tmp_path)
-
-    def unavailable(self, worker):
-        raise VaultUnavailable("synthetic private failure")
-
-    monkeypatch.setattr(VaultLeaseStore, "require_cas", unavailable)
-
-    async def exercise() -> None:
-        async with Client(create_server(config, store), raise_exceptions=True) as client:
-            result = await client.call_tool("grokbot_active")
-            assert result.is_error is True
-            assert "synthetic private failure" not in str(result)
-            assert result.structured_content is None
-
-    asyncio.run(exercise())
-    store.close()
-
-
-def test_real_stdio_transport_serves_status(tmp_path: Path) -> None:
-    store = journal(tmp_path)
-    store.close()
-    config = configuration(tmp_path)
-    for name in ("role", "secret"):
-        path = tmp_path / name
-        path.write_text("synthetic-only\n")
-        os.chmod(path, 0o600)
-    (tmp_path / "ca").write_text("synthetic CA placeholder\n")
-    config_file = tmp_path / "config.toml"
-    config_file.write_text(
-        "version = 1\n"
-        f'vault_address = "{config.vault_address}"\n'
-        'vault_mount = "kv"\n'
-        f'vault_role_id_file = "{tmp_path / "role"}"\n'
-        f'vault_secret_id_file = "{tmp_path / "secret"}"\n'
-        f'vault_ca_file = "{tmp_path / "ca"}"\n'
-        f'github_ca_file = "{tmp_path / "ca"}"\n'
-        f'webhook_ca_file = "{tmp_path / "ca"}"\n'
-        f'job_database = "{config.job_database}"\n'
-        'control_repository = "example/control"\n'
-        "[workers.worker-a]\n"
-        'webhook_secret_path = "webhook/a"\n'
-        'app_secret_path = "app/a"\n'
-        'lease_prefix = "leases"\n'
-        'lease_worker = "shared-a"\n'
-        "[workspaces]\n"
-    )
-    os.chmod(config_file, 0o600)
-
-    async def exercise() -> None:
-        params = StdioServerParameters(
-            command=sys.executable,
-            args=["-m", "codex_grokbot_mcp.server", "--config", str(config_file)],
-            env={"PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")},
+    def test_x_query_round_trip_through_the_tools(self) -> None:
+        recorder = RecordingTransport(
+            self.inbox, responder=lambda packet: ok_body(packet["job_id"], "x_query")
         )
-        async with Client(params) as client:
-            names = {tool.name for tool in (await client.list_tools()).tools}
-            assert names == {
-                "grokbot_status",
-                "grokbot_inspect_job",
-                "grokbot_active",
-                "grokbot_delegate",
-                "grokbot_result",
-                "grokbot_diagnose",
-                "grokbot_diagnostic_result",
-            }
-            result = (
-                await client.call_tool("grokbot_status", {"job_id": "job-123"})
-            ).structured_content
-            assert result == {
-                "job_id": "job-123",
-                "worker_id": "worker-a",
-                "state": "uncertain",
-                "updated_at": result["updated_at"],
-            }
+        server = create_server(self.config, self.store, inbox=self.inbox)
 
-    asyncio.run(exercise())
+        async def scenario():
+            async with Client(server) as client:
+                started = (
+                    await client.call_tool(
+                        "grokbot_x_query", {"query": "What are people saying about Gemini 4?"}
+                    )
+                ).structured_content
+                job_id = started["job_id"]
+                await wait_until(lambda: self.state(job_id) == "ready")
+                status = (
+                    await client.call_tool("grokbot_status", {"job_id": job_id})
+                ).structured_content
+                result = (
+                    await client.call_tool("grokbot_result", {"job_id": job_id})
+                ).structured_content
+                active = (await client.call_tool("grokbot_active")).structured_content
+                return started, status, result, active
+
+        with self.transport(recorder) as transport:
+            started, status, result, active = asyncio.run(scenario())
+
+        self.assertEqual(started, {"job_id": started["job_id"], "state": "queued"})
+        self.assertEqual(status["state"], "ready")
+        self.assertEqual(status["job_type"], "x_query")
+        self.assertEqual(result["state"], "ready")
+        self.assertEqual(result["answer"], "A short bounded answer.")
+        self.assertEqual(result["summary"], "One line.")
+        self.assertEqual(result["sources"], ["https://example.invalid/post/1"])
+        self.assertEqual(active, {"jobs": []})
+        self.assertEqual(transport.packet["job_type"], "x_query")
+
+    def test_ask_tool_round_trip(self) -> None:
+        recorder = RecordingTransport(
+            self.inbox, responder=lambda packet: ok_body(packet["job_id"], "ask", sources=[])
+        )
+        server = create_server(self.config, self.store, inbox=self.inbox)
+
+        async def scenario():
+            async with Client(server) as client:
+                started = (
+                    await client.call_tool("grokbot_ask", {"question": "Summarise the notes."})
+                ).structured_content
+                job_id = started["job_id"]
+                await wait_until(lambda: self.state(job_id) == "ready")
+                result = (
+                    await client.call_tool("grokbot_result", {"job_id": job_id})
+                ).structured_content
+                return started, result
+
+        with self.transport(recorder) as transport:
+            started, result = asyncio.run(scenario())
+
+        self.assertEqual(started["state"], "queued")
+        self.assertEqual(transport.packet["job_type"], "ask")
+        self.assertEqual(result["state"], "ready")
+        self.assertEqual(result["sources"], [])
+
+    def test_status_and_result_for_an_unknown_job(self) -> None:
+        server = create_server(self.config, self.store, inbox=self.inbox)
+
+        async def scenario():
+            async with Client(server) as client:
+                status = (
+                    await client.call_tool("grokbot_status", {"job_id": OTHER_JOB_ID})
+                ).structured_content
+                result = (
+                    await client.call_tool("grokbot_result", {"job_id": OTHER_JOB_ID})
+                ).structured_content
+                unusable = (
+                    await client.call_tool("grokbot_status", {"job_id": "not-a-uuid"})
+                ).structured_content
+                return status, result, unusable
+
+        status, result, unusable = asyncio.run(scenario())
+
+        self.assertEqual(status, {"job_id": OTHER_JOB_ID, "state": "not_found"})
+        self.assertEqual(result, {"job_id": OTHER_JOB_ID, "state": "not_found"})
+        self.assertEqual(unusable, {"job_id": "not-a-uuid", "state": "not_found"})
+
+    def test_active_lists_open_requests_only(self) -> None:
+        self.store.create_request(JOB_ID, "ask", deadline())
+        self.store.create_request(OTHER_JOB_ID, "x_query", deadline())
+        self.store.advance(OTHER_JOB_ID, "failed")
+        server = create_server(self.config, self.store, inbox=self.inbox)
+
+        async def scenario():
+            async with Client(server) as client:
+                return (await client.call_tool("grokbot_active")).structured_content
+
+        active = asyncio.run(scenario())
+
+        self.assertEqual(
+            active, {"jobs": [{"job_id": JOB_ID, "job_type": "ask", "state": "uncertain"}]}
+        )
+
+    def test_invalid_prompt_returns_a_tool_error_without_journaling(self) -> None:
+        server = create_server(self.config, self.store, inbox=self.inbox)
+
+        async def scenario():
+            async with Client(server, raise_exceptions=True) as client:
+                return await client.call_tool("grokbot_x_query", {"query": "   "})
+
+        result = asyncio.run(scenario())
+
+        self.assertTrue(result.is_error)
+        self.assertEqual(self.store.list_open(), ())
+
+    def test_session_start_resumes_a_dispatched_request(self) -> None:
+        self.store.create_request(JOB_ID, "ask", deadline())
+        self.inbox.inbox.register(JOB_ID, "result", token_hash(CALLBACK_TOKEN), deadline())
+        self.store.advance(JOB_ID, "dispatching")
+        self.store.advance(JOB_ID, "dispatched")
+        self.inbox.post(
+            {"job_id": JOB_ID, "context": {"callback_token": CALLBACK_TOKEN}},
+            ok_body(JOB_ID, "ask"),
+        )
+        self.store.create_request(OTHER_JOB_ID, "x_query", deadline())
+        server = create_server(self.config, self.store, inbox=self.inbox)
+
+        async def scenario():
+            async with Client(server) as client:
+                await wait_until(
+                    lambda: (
+                        self.state(JOB_ID) == "ready" and self.state(OTHER_JOB_ID) == "uncertain"
+                    )
+                )
+                return (
+                    await client.call_tool("grokbot_result", {"job_id": JOB_ID})
+                ).structured_content
+
+        result = asyncio.run(scenario())
+
+        self.assertEqual(result["state"], "ready")
+        self.assertEqual(result["answer"], "A short bounded answer.")
+        self.assertEqual(self.state(OTHER_JOB_ID), "uncertain")
 
 
-def test_available_lease_does_not_hide_uncertain_local_job(tmp_path: Path, monkeypatch) -> None:
-    store = journal(tmp_path)
-    store.advance("job-123", "lease_held")
-    config = configuration(tmp_path)
-    monkeypatch.setattr(VaultLeaseStore, "require_cas", lambda self, worker: None)
-    monkeypatch.setattr(VaultLeaseStore, "read", lambda self, worker: None)
+class StdioServerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temporary.cleanup)
+        self.root = Path(self._temporary.name)
+        private = self.root / "private"
+        private.mkdir(mode=0o700)
+        self.database = private / "jobs.sqlite3"
+        self.store = JobStore.open(self.database)
+        self.store.create_request(JOB_ID, "ask", deadline())
+        self.store.close()
+        self.config_file = write_config_file(self.root, config_text(self.root))
 
-    async def exercise() -> None:
-        async with Client(create_server(config, store), raise_exceptions=True) as client:
-            result = (await client.call_tool("grokbot_active")).structured_content
-            assert result["workers"] == [
-                {"worker_id": "worker-a", "state": "reconciliation_required"}
-            ]
-            assert result["jobs"][0]["state"] == "uncertain"
+    def test_stdio_transport_serves_the_tool_surface_and_reconciles(self) -> None:
+        async def scenario():
+            parameters = StdioServerParameters(
+                command=sys.executable,
+                args=[
+                    "-m",
+                    "codex_grokbot_mcp.server",
+                    "--config",
+                    str(self.config_file),
+                ],
+                env={"PYTHONPATH": str(SOURCE_ROOT)},
+            )
+            async with Client(parameters) as client:
+                names = {tool.name for tool in (await client.list_tools()).tools}
+                status = (
+                    await client.call_tool("grokbot_status", {"job_id": JOB_ID})
+                ).structured_content
+                missing = (
+                    await client.call_tool("grokbot_status", {"job_id": OTHER_JOB_ID})
+                ).structured_content
+                return names, status, missing
 
-    asyncio.run(exercise())
-    store.close()
+        names, status, missing = asyncio.run(scenario())
+
+        self.assertEqual(names, TOOL_NAMES)
+        self.assertEqual(status["state"], "uncertain")
+        self.assertEqual(status["job_type"], "ask")
+        self.assertIsInstance(datetime.fromisoformat(status["updated_at"]), datetime)
+        self.assertEqual(missing, {"job_id": OTHER_JOB_ID, "state": "not_found"})
+
+    def test_stdio_transport_rejects_an_unusable_configuration(self) -> None:
+        broken = write_config_file(self.root, config_text(self.root), mode=0o644)
+
+        async def scenario():
+            parameters = StdioServerParameters(
+                command=sys.executable,
+                args=["-m", "codex_grokbot_mcp.server", "--config", str(broken)],
+                env={"PYTHONPATH": str(SOURCE_ROOT)},
+            )
+            async with Client(parameters) as client:
+                return await client.list_tools()
+
+        with self.assertRaises(Exception):  # noqa: B017 - the child exits before initializing
+            asyncio.run(scenario())
+
+
+if __name__ == "__main__":
+    unittest.main()
