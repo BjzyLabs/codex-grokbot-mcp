@@ -110,6 +110,13 @@ class Coordinator:
                 "error_code": record.error_code,
                 "error_message": record.error_message,
             }
+        if record.state == "conflict":
+            return {
+                "job_id": record.job_id,
+                "state": "conflict",
+                "error_code": record.error_code,
+                "error_message": record.error_message,
+            }
         return {"job_id": record.job_id, "state": record.state}
 
     def _spawn(self, job_id: str, work: Awaitable[None], *, prefix: str) -> None:
@@ -207,7 +214,11 @@ class Coordinator:
             return
         try:
             validated = validate_result(record.job_id, record.job_type, body, now=datetime.now(UTC))
-        except (PacketError, TypeError):
+        except (PacketError, TypeError) as error:
+            LOGGER.warning(
+                "request %s callback failed validation: %s", record.job_id[:8], error
+            )
+            self._record_conflict(record.job_id, "invalid_result", str(error))
             self._settle_state(record.job_id, "conflict")
             return
         try:
@@ -265,3 +276,10 @@ class Coordinator:
             self.store.advance(job_id, state)
         except JobStateError:
             LOGGER.debug("request %s cannot move to %s", job_id[:8], state)
+
+    def _record_conflict(self, job_id: str, code: str, message: str) -> None:
+        """Record why a callback conflicted, while the journal still allows it."""
+        try:
+            self.store.record_error(job_id, code, message)
+        except JobStateError:
+            LOGGER.debug("request %s cannot record its conflict reason", job_id[:8])

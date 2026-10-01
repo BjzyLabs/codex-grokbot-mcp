@@ -28,7 +28,7 @@ The prompt itself is never journaled; it exists only in the packet.
 | --- | --- |
 | Valid `status: "ok"` callback | `ready` |
 | Valid `status: "error"` callback | `failed`, with the error code and message |
-| Stored body that fails validation | `conflict` |
+| Stored body that fails validation | `conflict`, with the validation reason recorded |
 | Ambiguous webhook outcome | `uncertain` |
 | Ambiguous inbox failure or deadline with no callback | `uncertain` |
 | Failure proven to precede the POST | `failed` |
@@ -67,4 +67,5 @@ request types are read-only.
 it re-fetches the stored body, requires the recorded callback digest, validates
 the body again, and only then returns the summary, answer, and sources. A
 changed or invalid body moves the job to `conflict` and returns an MCP tool
-error. A `failed` job reports the recorded error code and message.
+error. A `failed` job reports the recorded error code and message; a `conflict`
+job reports the recorded validation reason alongside its state.
