@@ -156,7 +156,8 @@ class Coordinator:
             return
         try:
             await asyncio.to_thread(transport.dispatch, packet)
-        except WebhookUncertain:
+        except WebhookUncertain as error:
+            LOGGER.warning("request %s webhook outcome uncertain: %s", job_id[:8], error)
             self._settle_state(job_id, "uncertain")
             return
         except WebhookError:
