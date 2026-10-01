@@ -1,44 +1,22 @@
 # Local Codex setup
 
-This is a local stdio MCP server. Run it on the same host as Codex and the
-opted-in source workspace. It requires Python 3.12+, Vault, a private control
-repository for private source, and a Grok Bot webhook that implements the v2
-coding packet and artifact contract.
+This is a local stdio MCP server. Run it on the same host as Codex, with a
+reachable Grok Bot webhook and the callback inbox origin that Grok Bot can
+reach. Python 3.12+ is required.
 
 ## Before connecting
 
-1. Provision the exact Vault AppRole, secret paths, and KV v2 lease metadata
-   described in [Vault setup](vault-setup.md). Keep credential files and the
-   configuration outside this public checkout. The configuration and AppRole
-   files must be regular, owner-owned files with mode `0600`; the journal
-   parent directory must have mode `0700`.
-2. Confirm the GitHub App installation is limited to the private control
-   repository and grants only the required permissions. See
-   [control transport](control-transport.md).
-3. Verify the **installed running revision** of every existing dispatcher
-   sharing the worker uses the same Vault CAS lease key and schema. Source
-   merged to Git is insufficient. The first live job is a monitored staged
-   canary; normal delegation follows its acceptance.
-4. Copy [the example configuration](../config.example.toml) to an owner-only
-   path outside Git. Replace every synthetic endpoint, Vault path, CA path,
-   repository name, and workspace path with the deployment's exact values.
-   Set `enabled = true` only for a workspace that explicitly opts in to the
-   named worker. Never put secret values in the TOML file.
-
-There is no alternate secret backend, transport, or lease mode. If a required
-path, permission, installed guard, or live contract is missing, stop and
-record the blocker. Do not redirect a job to another Bot or endpoint.
-
-## Develop acceptance gate
-
-Test the integration from the `develop` branch. First run the local protocol
-and contract checks. After the installed dispatcher lease guard and live
-prerequisites are verified, run one monitored staged canary from `develop`
-and review its result. Keep the MVP and subsequent feature work on `develop`
-until the operator completes and accepts a full end-to-end test on their
-workstation. Any later promotion to `main` requires a separate release
-decision. A green pull request, local test suite, or staged canary alone does
-not authorize promotion.
+1. Confirm the Grok Bot routine accepts a v3 `x_query` or `ask` packet and
+   answers by callback. The payload contract is in
+   [result delivery](result-delivery.md).
+2. Confirm the callback inbox is reachable from the Bot and that you hold its
+   requestor credential.
+3. Copy [the example configuration](../config.example.toml) to an owner-only
+   regular file outside Git, replace every synthetic value, and `chmod 0600`
+   it. The rules are in [configuration](configuration.md). Never put the
+   configuration file in the repository.
+4. Confirm the journal path's parent directory is private (`0700`). The server
+   creates the `0600` database file on first run.
 
 ## Install and connect
 
@@ -51,11 +29,9 @@ python3.12 -m venv .venv
 ```
 
 If `.venv` already exists, use it instead of recreating it. The installation
-adds the official Python MCP SDK declared by the package; it does not create
-Vault or GitHub credentials.
+adds only the official Python MCP SDK declared by the package.
 
-After the live gate above is satisfied, register the stdio command in Codex
-with absolute paths:
+Register the stdio command in Codex with absolute paths:
 
 ```sh
 codex mcp add codex-grokbot -- \
@@ -64,37 +40,29 @@ codex mcp add codex-grokbot -- \
 codex mcp list
 ```
 
-Codex also supports the equivalent `[mcp_servers.codex-grokbot]` entry in
-its private `config.toml` with `command` and `args`; see the
+Codex also supports the equivalent `[mcp_servers.codex-grokbot]` entry in its
+private `config.toml` with `command` and `args`; see the
 [official Codex MCP documentation](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
 Keep this machine-specific entry outside the public repository. Restart the
-Codex client after adding the server, then confirm it lists
-`grokbot_status`, `grokbot_active`, `grokbot_delegate`, and
-`grokbot_result`. A working status tool is a protocol check, not proof that
-the worker webhook accepts v2 jobs.
+Codex client after adding the server and confirm it lists
+`grokbot_x_query`, `grokbot_ask`, `grokbot_status`, `grokbot_result`, and
+`grokbot_active`.
 
 The optional [Codex skill](../.agents/skills/codex-grokbot/SKILL.md) lives in
-this repository. Codex discovers it while working in this checkout. To use it
-from another repository, install the reviewed skill folder in a
-[supported user skill location](https://learn.chatgpt.com/docs/build-skills),
-such as `~/.agents/skills/codex-grokbot`. The skill contains no credentials.
+this repository and contains no credentials.
 
-## One bounded task
+## First request
 
-Choose one configured worker and name the exact relative source files it may
-read and modify. For example, an opted-in project could submit a goal with
-`read_paths = ["module.py"]`, `write_paths = ["module.py"]`, one or more
-acceptance checks, and `effort_hint = "small"`. The hint is advisory; it
-does not select a model or enlarge the worker's authority. Split work that
-cannot fit a 45-minute job.
+Call `grokbot_ask` with one bounded question, or `grokbot_x_query` for public X
+research. Both return a job ID immediately. Poll `grokbot_status` and call
+`grokbot_result` once the state is `ready`.
 
-`grokbot_delegate` returns a job ID immediately. Use `grokbot_status` to
-check progress and `grokbot_result` only when the state is `ready`. Codex
-must review the patch and actual changed paths, apply an accepted patch in
-the source workspace, and run its relevant tests. No MCP tool applies a patch
-or merges a PR for Codex.
+`grokbot_result` re-fetches the stored callback, compares its digest with the
+one recorded at completion, and validates the body again before returning the
+summary, answer, and sources. It never applies anything and never edits a
+repository.
 
-If a job becomes `uncertain` or `conflict`, do not resubmit it or release
-its lease from local journal state. Follow the
-[reconciliation boundary](mcp-coordinator.md) and compare the exact live
-Vault lease and control branch before any operator action.
+If a job becomes `uncertain` or `conflict`, do not resubmit it. An
+`uncertain` job may already have been delivered; a `conflict` job returned a
+body the requestor will not accept. Report the job ID and follow the
+[reconciliation boundary](mcp-coordinator.md).

@@ -1,510 +1,239 @@
 from __future__ import annotations
 
-import os
 import sqlite3
-import stat
-import subprocess
-from datetime import UTC, datetime, timedelta
+import tempfile
+import unittest
+from datetime import UTC, datetime
 from pathlib import Path
 
-import pytest
+from support import JOB_ID, OTHER_JOB_ID, deadline
 
-from codex_grokbot_mcp.jobs import JobStateError, JobStore, artifact_digest
-from codex_grokbot_mcp.local import Workspace
+from codex_grokbot_mcp.jobs import NEXT_STATES, SCHEMA_VERSION, JobStateError, JobStore
 
-
-def git(repo: Path, *args: str) -> str:
-    return subprocess.run(
-        ["git", *args], cwd=repo, check=True, capture_output=True, text=True
-    ).stdout.strip()
+DIGEST = "a" * 64
+OTHER_DIGEST = "b" * 64
 
 
-@pytest.fixture
-def context(tmp_path: Path):
-    root = tmp_path / "source"
-    root.mkdir()
-    git(root, "init", "-q")
-    git(root, "remote", "add", "origin", "https://github.com/example/source.git")
-    (root / "module.py").write_text("private source marker\n")
-    git(root, "add", ".")
-    git(
-        root,
-        "-c",
-        "user.name=Test",
-        "-c",
-        "user.email=test@example.invalid",
-        "commit",
-        "-qm",
-        "base",
-    )
-    return Workspace.open(root, opted_in=True).snapshot(
-        read_paths=["module.py"], write_paths=["module.py"]
-    )
+class JobStoreTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temporary.cleanup)
+        self.root = Path(self._temporary.name)
+        self.private = self.root / "private"
+        self.private.mkdir(mode=0o700)
+        self.path = self.private / "jobs.sqlite3"
+        self.store = JobStore.open(self.path)
+        self.addCleanup(self.store.close)
 
+    def request(self, job_id: str = JOB_ID, job_type: str = "x_query") -> str:
+        self.store.create_request(job_id, job_type, deadline())
+        return job_id
 
-def new_store(tmp_path: Path) -> JobStore:
-    return JobStore.open(tmp_path / "private" / "jobs.sqlite3")
+    def dispatched(self, job_id: str = JOB_ID, job_type: str = "x_query") -> str:
+        self.request(job_id, job_type)
+        self.store.advance(job_id, "dispatching")
+        self.store.advance(job_id, "dispatched")
+        return job_id
 
+    def test_round_trip_records_both_request_types(self) -> None:
+        self.request(JOB_ID, "x_query")
+        self.request(OTHER_JOB_ID, "ask")
 
-def create_job(store: JobStore, context) -> None:
-    store.create(
-        "job-123",
-        "worker-a",
-        context,
-        lease_owner="codex-grokbot-mcp",
-        control_branch="grokbot/job-coding-1234abcd",
-        artifact_path="artifacts/patch-1234abcd.json",
-    )
+        first = self.store.get(JOB_ID)
+        second = self.store.get(OTHER_JOB_ID)
 
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        assert first is not None and second is not None
+        self.assertEqual((first.job_type, first.state), ("x_query", "queued"))
+        self.assertEqual((second.job_type, second.state), ("ask", "queued"))
+        self.assertEqual(first.created_at, first.updated_at)
+        self.assertGreater(first.deadline_at, datetime.now(UTC))
+        self.assertIsNone(first.body_sha256)
 
-def create_uuid_job(store: JobStore, context) -> None:
-    store.create(
-        "1234abcd-1234-4123-8123-123456789abc",
-        "worker-a",
-        context,
-        lease_owner="codex-grokbot-mcp",
-        control_branch="grokbot/job-coding-1234abcd",
-        artifact_path="artifacts/patch-1234abcd.json",
-    )
+    def test_unknown_or_unusable_identifier_is_not_found(self) -> None:
+        self.assertIsNone(self.store.get(OTHER_JOB_ID))
+        self.assertIsNone(self.store.get("not-a-uuid"))
+        self.assertIsNone(self.store.get(JOB_ID.upper()))
 
+    def test_creation_validates_identity_type_and_deadline(self) -> None:
+        with self.assertRaises(JobStateError):
+            self.store.create_request("not-a-uuid", "x_query", deadline())
+        with self.assertRaises(JobStateError):
+            self.store.create_request(JOB_ID, "coding", deadline())
+        with self.assertRaises(JobStateError):
+            self.store.create_request(JOB_ID, "x_query", datetime(2026, 1, 1, tzinfo=UTC))
+        with self.assertRaises(JobStateError):
+            self.store.create_request(JOB_ID, "x_query", datetime.now(UTC))
+        with self.assertRaises(JobStateError):
+            self.store.create_request(JOB_ID, "x_query", deadline())
+            self.store.create_request(JOB_ID, "x_query", deadline())
 
-def test_private_store_and_no_source_content_survive_reopen(tmp_path: Path, context) -> None:
-    store = new_store(tmp_path)
-    create_job(store, context)
-    store.close()
+    def test_state_graph_is_enforced(self) -> None:
+        self.request(JOB_ID)
 
-    db = tmp_path / "private" / "jobs.sqlite3"
-    assert stat.S_IMODE(db.parent.stat().st_mode) == 0o700
-    assert stat.S_IMODE(db.stat().st_mode) == 0o600
-    assert b"private source marker" not in db.read_bytes()
-    reopened = JobStore.open(db)
-    record = reopened.get("job-123")
-    assert record is not None
-    assert record.state == "queued"
-    assert record.worker_id == "worker-a"
-    assert record.snapshot_digest == context.snapshot_digest
-    assert record.control_branch == "grokbot/job-coding-1234abcd"
-    assert record.lease_owner == "codex-grokbot-mcp"
-    assert record.read_paths == ("module.py",)
-    reopened.close()
+        with self.assertRaises(JobStateError):
+            self.store.advance(JOB_ID, "dispatched")
+        with self.assertRaises(JobStateError):
+            self.store.advance(JOB_ID, "nonsense")
+        self.store.advance(JOB_ID, "dispatching")
+        with self.assertRaises(JobStateError):
+            self.store.advance(JOB_ID, "queued")
+        self.store.advance(JOB_ID, "dispatched")
+        with self.assertRaises(JobStateError):
+            self.store.advance(JOB_ID, "dispatching")
 
+    def test_ready_is_reachable_only_with_a_recorded_digest(self) -> None:
+        self.dispatched()
 
-def test_diagnostic_journal_persists_advisory_reply_without_callback_token(
-    tmp_path: Path, context
-) -> None:
-    store = new_store(tmp_path)
-    create_uuid_job(store, context)
-    diagnostic_id = "2345abcd-1234-4123-8123-123456789abc"
-    store.create_diagnostic(
-        diagnostic_id,
-        "1234abcd-1234-4123-8123-123456789abc",
-        "worker-a",
-        "chief-of-staff",
-        "devcoder",
-    )
-    store.transition_diagnostic(diagnostic_id, "dispatching")
-    store.transition_diagnostic(diagnostic_id, "dispatched")
-    store.transition_diagnostic(
-        diagnostic_id,
-        "replied",
-        digest="a" * 64,
-        reply="Finished; draft PR is open.",
-        completed_at="2026-09-28T12:00:00Z",
-    )
-    store.close()
+        with self.assertRaisesRegex(JobStateError, "digest"):
+            self.store.advance(JOB_ID, "ready")
+        self.store.record_result(JOB_ID, DIGEST, "One line.", "answer", ["source"])
+        self.store.advance(JOB_ID, "ready")
 
-    reopened = JobStore.open(tmp_path / "private" / "jobs.sqlite3")
-    record = reopened.get_diagnostic(diagnostic_id)
-    assert record is not None
-    assert record.state == "replied"
-    assert record.target_job_id == "1234abcd-1234-4123-8123-123456789abc"
-    assert record.reply == "Finished; draft PR is open."
-    assert record.callback_body_sha256 == "a" * 64
-    assert b"callback_token" not in (tmp_path / "private" / "jobs.sqlite3").read_bytes()
-    reopened.close()
+        record = self.store.get(JOB_ID)
+        assert record is not None
+        self.assertEqual(record.state, "ready")
+        self.assertEqual(record.body_sha256, DIGEST)
+        self.assertEqual(record.summary, "One line.")
+        self.assertEqual(record.answer_json, '"answer"')
+        self.assertEqual(record.sources_json, '["source"]')
+        with self.assertRaises(JobStateError):
+            self.store.advance(JOB_ID, "ready")
+        self.store.advance(JOB_ID, "conflict")
+        with self.assertRaises(JobStateError):
+            self.store.advance(JOB_ID, "ready")
 
+    def test_state_graph_dictionary_matches_the_documented_terminal_states(self) -> None:
+        self.assertEqual(NEXT_STATES["conflict"], set())
+        self.assertEqual(NEXT_STATES["failed"], set())
+        self.assertEqual(NEXT_STATES["ready"], {"conflict"})
+        self.assertEqual(NEXT_STATES["dispatched"], {"ready", "failed", "uncertain", "conflict"})
 
-def test_pending_diagnostic_becomes_uncertain_after_restart(tmp_path: Path, context) -> None:
-    store = new_store(tmp_path)
-    create_uuid_job(store, context)
-    diagnostic_id = "2345abcd-1234-4123-8123-123456789abc"
-    store.create_diagnostic(
-        diagnostic_id,
-        "1234abcd-1234-4123-8123-123456789abc",
-        "worker-a",
-        "chief-of-staff",
-        "coder",
-    )
-    store.transition_diagnostic(diagnostic_id, "dispatching")
-    store.close()
+    def test_failed_requests_may_carry_a_validated_error(self) -> None:
+        self.dispatched(JOB_ID, "ask")
 
-    reopened = JobStore.open(tmp_path / "private" / "jobs.sqlite3")
-    reopened.reconcile_restart()
-    assert reopened.get_diagnostic(diagnostic_id).state == "uncertain"
-    with pytest.raises(JobStateError, match="transition"):
-        reopened.transition_diagnostic(diagnostic_id, "dispatched")
-    reopened.close()
+        with self.assertRaises(JobStateError):
+            self.store.record_error(JOB_ID, "", "message")
+        self.store.record_error(JOB_ID, "x_auth_required", "The X connection needs attention.")
+        with self.assertRaises(JobStateError):
+            self.store.record_error(JOB_ID, "again", "again")
+        self.store.advance(JOB_ID, "failed")
 
+        record = self.store.get(JOB_ID)
+        assert record is not None
+        self.assertEqual(record.state, "failed")
+        self.assertEqual(record.error_code, "x_auth_required")
+        self.assertIn("X connection", record.error_message)
+        with self.assertRaises(JobStateError):
+            self.store.advance(JOB_ID, "ready")
 
-def test_no_reply_state_is_only_stored_with_validated_callback_evidence(
-    tmp_path: Path, context
-) -> None:
-    store = new_store(tmp_path)
-    create_uuid_job(store, context)
-    diagnostic_id = "2345abcd-1234-4123-8123-123456789abc"
-    store.create_diagnostic(
-        diagnostic_id,
-        "1234abcd-1234-4123-8123-123456789abc",
-        "worker-a",
-        "chief-of-staff",
-        "coder",
-    )
-    store.transition_diagnostic(diagnostic_id, "dispatching")
-    store.transition_diagnostic(diagnostic_id, "dispatched")
-    with pytest.raises(JobStateError, match="callback identity"):
-        store.transition_diagnostic(diagnostic_id, "no_reply")
-    store.transition_diagnostic(
-        diagnostic_id,
-        "no_reply",
-        digest="b" * 64,
-        completed_at="2026-09-28T12:00:00Z",
-    )
-    record = store.get_diagnostic(diagnostic_id)
-    assert record.state == "no_reply"
-    assert record.callback_body_sha256 == "b" * 64
-    assert record.completed_at == "2026-09-28T12:00:00Z"
-    store.close()
+    def test_result_and_error_can_only_be_recorded_while_dispatched(self) -> None:
+        self.request(JOB_ID)
 
+        with self.assertRaises(JobStateError):
+            self.store.record_result(JOB_ID, DIGEST, "summary", "answer", [])
+        with self.assertRaises(JobStateError):
+            self.store.record_error(JOB_ID, "code", "message")
+        self.store.advance(JOB_ID, "dispatching")
+        with self.assertRaises(JobStateError):
+            self.store.record_result(JOB_ID, DIGEST, "summary", "answer", [])
+        self.store.advance(JOB_ID, "dispatched")
+        with self.assertRaises(JobStateError):
+            self.store.record_result(JOB_ID, "not-a-digest", "summary", "answer", [])
+        with self.assertRaises(JobStateError):
+            self.store.record_result(JOB_ID, DIGEST, "summary", "answer", "not-a-list")
 
-def test_transitions_are_atomic_and_restart_is_uncertain(tmp_path: Path, context) -> None:
-    store = new_store(tmp_path)
-    create_job(store, context)
-    with pytest.raises(JobStateError):
-        store.advance("job-123", "dispatching")
-    assert store.get("job-123").state == "queued"
-    store.advance("job-123", "lease_held")
-    store.record_token_expiry("job-123", datetime.now(UTC) + timedelta(hours=1))
-    store.advance("job-123", "dispatching")
-    store.close()
+    def test_list_open_excludes_terminal_states(self) -> None:
+        self.request(JOB_ID)
+        self.request(OTHER_JOB_ID, "ask")
+        self.store.advance(OTHER_JOB_ID, "dispatching")
 
-    reopened = JobStore.open(tmp_path / "private" / "jobs.sqlite3")
-    assert reopened.reconcile_restart() == ("job-123",)
-    assert reopened.get("job-123").state == "uncertain"
-    with pytest.raises(JobStateError):
-        reopened.advance("job-123", "dispatching")
-    reopened.close()
-
-
-def test_dispatched_job_is_uncertain_after_restart_and_never_requeued(
-    tmp_path: Path, context
-) -> None:
-    store = new_store(tmp_path)
-    create_job(store, context)
-    store.advance("job-123", "lease_held")
-    store.record_token_expiry("job-123", datetime.now(UTC) + timedelta(hours=1))
-    for state in ("dispatching", "dispatched"):
-        store.advance("job-123", state)
-    store.close()
-
-    reopened = JobStore.open(tmp_path / "private" / "jobs.sqlite3")
-    assert reopened.reconcile_restart() == ("job-123",)
-    assert reopened.get("job-123").state == "uncertain"
-    assert reopened.reconcile_restart() == ()
-    reopened.close()
-
-
-def test_workspace_drift_marks_conflict_without_losing_evidence(tmp_path: Path, context) -> None:
-    store = new_store(tmp_path)
-    create_job(store, context)
-    assert store.verify_workspace("job-123") is True
-    (context.root / "module.py").write_text("changed after dispatch\n")
-    assert store.verify_workspace("job-123") is False
-    record = store.get("job-123")
-    assert record.state == "conflict"
-    assert record.snapshot_digest == context.snapshot_digest
-    with pytest.raises(JobStateError):
-        store.advance("job-123", "ready")
-    store.close()
-
-
-def test_rejects_unsafe_store_paths_and_duplicate_jobs(tmp_path: Path, context) -> None:
-    db_dir = tmp_path / "private"
-    db_dir.mkdir(mode=0o700)
-    link = db_dir / "jobs.sqlite3"
-    link.symlink_to(tmp_path / "outside")
-    with pytest.raises(JobStateError):
-        JobStore.open(link)
-    link.unlink()
-    os.chmod(db_dir, 0o755)  # noqa: S103
-    with pytest.raises(JobStateError):
-        JobStore.open(link)
-    os.chmod(db_dir, 0o700)
-    store = JobStore.open(link)
-    create_job(store, context)
-    with pytest.raises(JobStateError):
-        create_job(store, context)
-    store.close()
-
-
-def test_invalid_dispatch_coordinates_are_rejected(tmp_path: Path, context) -> None:
-    store = new_store(tmp_path)
-    with pytest.raises(JobStateError):
-        store.create(
-            "job-123",
-            "worker-a",
-            context,
-            lease_owner="codex-grokbot-mcp",
-            control_branch="../other",
-            artifact_path="artifacts/patch-1234abcd.json",
+        self.assertEqual(
+            {record.job_id for record in self.store.list_open()}, {JOB_ID, OTHER_JOB_ID}
         )
-    assert store.get("job-123") is None
-    store.close()
+
+        self.store.advance(JOB_ID, "failed")
+        self.assertEqual({record.job_id for record in self.store.list_open()}, {OTHER_JOB_ID})
+
+        self.store.advance(OTHER_JOB_ID, "dispatched")
+        self.store.record_result(OTHER_JOB_ID, DIGEST, "summary", "answer", [])
+        self.store.advance(OTHER_JOB_ID, "ready")
+        self.assertEqual(self.store.list_open(), ())
+
+    def test_list_open_keeps_uncertain_requests_visible(self) -> None:
+        self.request(JOB_ID)
+        self.store.advance(JOB_ID, "uncertain")
+
+        self.assertEqual([record.state for record in self.store.list_open()], ["uncertain"])
+
+    def test_reconcile_restart_is_idempotent(self) -> None:
+        self.request(JOB_ID)
+        self.request(OTHER_JOB_ID, "ask")
+        self.store.advance(OTHER_JOB_ID, "dispatching")
+
+        self.assertEqual(self.store.reconcile_restart(), ())
+        assert self.store.get(JOB_ID) is not None
+        self.assertEqual(self.store.get(JOB_ID).state, "uncertain")
+        self.assertEqual(self.store.get(OTHER_JOB_ID).state, "uncertain")
+        self.assertEqual(self.store.reconcile_restart(), ())
+
+    def test_reconcile_restart_returns_dispatched_jobs_only(self) -> None:
+        self.dispatched(JOB_ID, "ask")
+        self.request(OTHER_JOB_ID)
+
+        self.assertEqual(self.store.reconcile_restart(), (JOB_ID,))
+
+        record = self.store.get(JOB_ID)
+        assert record is not None
+        self.assertEqual(record.state, "dispatched")
+        self.assertEqual(self.store.get(OTHER_JOB_ID).state, "uncertain")
+
+    def test_job_database_must_be_private(self) -> None:
+        self.path.chmod(0o644)
+        with self.assertRaisesRegex(JobStateError, "private"):
+            JobStore.open(self.path)
+
+        self.path.chmod(0o600)
+        self.private.chmod(0o755)
+        with self.assertRaisesRegex(JobStateError, "directory"):
+            JobStore.open(self.path)
+
+    def test_relative_job_database_is_rejected(self) -> None:
+        with self.assertRaisesRegex(JobStateError, "absolute"):
+            JobStore.open(Path("relative/jobs.sqlite3"))
+
+    def test_legacy_schema_is_rebuilt(self) -> None:
+        legacy = self.private / "legacy.sqlite3"
+        connection = sqlite3.connect(legacy)
+        connection.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+        connection.execute("INSERT INTO schema_version(version) VALUES (5)")
+        connection.execute("CREATE TABLE jobs (job_id TEXT PRIMARY KEY, worker_id TEXT)")
+        connection.execute("CREATE TABLE worker_diagnostics (diagnostic_id TEXT PRIMARY KEY)")
+        connection.commit()
+        connection.close()
+        legacy.chmod(0o600)
+
+        store = JobStore.open(legacy)
+        self.addCleanup(store.close)
+
+        check = sqlite3.connect(legacy)
+        try:
+            version = check.execute("SELECT version FROM schema_version").fetchall()
+            tables = {
+                row[0] for row in check.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            columns = {row[1] for row in check.execute("PRAGMA table_info(jobs)")}
+        finally:
+            check.close()
+
+        self.assertEqual(version, [(SCHEMA_VERSION,)])
+        self.assertNotIn("worker_diagnostics", tables)
+        self.assertIn("deadline_at", columns)
+        self.assertNotIn("worker_id", columns)
+        store.create_request(JOB_ID, "ask", deadline())
+        self.assertEqual(store.get(JOB_ID).job_type, "ask")
 
 
-def test_queued_job_requires_reconciliation_after_restart(tmp_path: Path, context) -> None:
-    store = new_store(tmp_path)
-    create_job(store, context)
-    store.close()
-    reopened = JobStore.open(tmp_path / "private" / "jobs.sqlite3")
-    assert reopened.reconcile_restart() == ("job-123",)
-    assert reopened.get("job-123").state == "uncertain"
-    reopened.close()
-
-
-def test_existing_unversioned_store_is_rejected(tmp_path: Path) -> None:
-    directory = tmp_path / "private"
-    directory.mkdir(mode=0o700)
-    db = directory / "jobs.sqlite3"
-    connection = sqlite3.connect(db)
-    connection.execute("CREATE TABLE unrelated (value TEXT)")
-    connection.close()
-    os.chmod(db, 0o600)
-    with pytest.raises(JobStateError, match="schema"):
-        JobStore.open(db)
-
-
-def test_database_open_failure_is_reported(tmp_path: Path, monkeypatch) -> None:
-    def denied(*_args, **_kwargs):
-        raise sqlite3.OperationalError("denied")
-
-    monkeypatch.setattr(sqlite3, "connect", denied)
-    with pytest.raises(JobStateError, match="schema"):
-        new_store(tmp_path)
-
-
-def test_two_jobs_cannot_reuse_a_control_branch_or_artifact(tmp_path: Path, context) -> None:
-    store = new_store(tmp_path)
-    create_job(store, context)
-    with pytest.raises(JobStateError, match="coordinates"):
-        store.create(
-            "job-456",
-            "worker-a",
-            context,
-            lease_owner="codex-grokbot-mcp",
-            control_branch="grokbot/job-coding-1234abcd",
-            artifact_path="artifacts/patch-1234abcd.json",
-        )
-    assert store.get("job-456") is None
-    store.close()
-
-
-def test_dispatch_requires_durable_nonsecret_token_expiry(tmp_path: Path, context) -> None:
-    store = new_store(tmp_path)
-    create_job(store, context)
-    store.advance("job-123", "lease_held")
-    with pytest.raises(JobStateError, match="expiry"):
-        store.advance("job-123", "dispatching")
-    expires = datetime.now(UTC) + timedelta(hours=1)
-    store.record_token_expiry("job-123", expires)
-    assert store.get("job-123").token_expires_at == expires
-    with pytest.raises(JobStateError):
-        store.record_token_expiry("job-123", expires)
-    store.advance("job-123", "dispatching")
-    store.close()
-
-    reopened = JobStore.open(tmp_path / "private" / "jobs.sqlite3")
-    assert reopened.reconcile_restart() == ("job-123",)
-    assert reopened.get("job-123").state == "uncertain"
-    assert reopened.get("job-123").token_expires_at == expires
-    reopened.close()
-
-
-def test_rejects_naive_or_short_token_expiry(tmp_path: Path, context) -> None:
-    store = new_store(tmp_path)
-    create_job(store, context)
-    store.advance("job-123", "lease_held")
-    for expires in (datetime.now(), datetime.now(UTC) + timedelta(minutes=5)):
-        with pytest.raises(JobStateError, match="expiry"):
-            store.record_token_expiry("job-123", expires)
-    assert store.get("job-123").token_expires_at is None
-    store.close()
-
-
-@pytest.mark.parametrize("prior_state", ["queued", "dispatching"])
-def test_schema_v1_journal_migrates_without_losing_jobs(
-    tmp_path: Path, context, prior_state: str
-) -> None:
-    directory = tmp_path / "private"
-    directory.mkdir(mode=0o700)
-    db = directory / "jobs.sqlite3"
-    connection = sqlite3.connect(db)
-    connection.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
-    connection.execute("INSERT INTO schema_version VALUES (1)")
-    connection.execute(
-        """CREATE TABLE jobs (
-            job_id TEXT PRIMARY KEY, worker_id TEXT NOT NULL,
-            lease_owner TEXT NOT NULL, root TEXT NOT NULL, target_repo TEXT NOT NULL,
-            head TEXT NOT NULL, branch TEXT NOT NULL, read_paths TEXT NOT NULL,
-            write_paths TEXT NOT NULL, snapshot_digest TEXT NOT NULL,
-            control_branch TEXT NOT NULL, artifact_path TEXT NOT NULL,
-            state TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-        )"""
-    )
-    now = datetime.now(UTC).isoformat()
-    connection.execute(
-        "INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            "job-123",
-            "worker-a",
-            "codex-grokbot-mcp",
-            str(context.root),
-            context.target_repo,
-            context.head,
-            context.branch,
-            '["module.py"]',
-            '["module.py"]',
-            context.snapshot_digest,
-            "grokbot/job-coding-1234abcd",
-            "artifacts/patch-1234abcd.json",
-            prior_state,
-            now,
-            now,
-        ),
-    )
-    connection.commit()
-    connection.close()
-    db.chmod(0o600)
-
-    store = JobStore.open(db)
-    assert store.get("job-123").snapshot_digest == context.snapshot_digest
-    assert store.get("job-123").token_expires_at is None
-    assert store.reconcile_restart() == ("job-123",)
-    assert store.get("job-123").state == "uncertain"
-    store.close()
-    with sqlite3.connect(db) as check:
-        assert check.execute("SELECT version FROM schema_version").fetchone()[0] == 5
-
-
-def test_validated_artifact_identity_is_required_and_survives_restart(
-    tmp_path: Path, context
-) -> None:
-    store = new_store(tmp_path)
-    create_job(store, context)
-    store.advance("job-123", "lease_held")
-    store.record_token_expiry("job-123", datetime.now(UTC) + timedelta(hours=1))
-    for state in ("dispatching", "dispatched", "artifact_received"):
-        store.advance("job-123", state)
-    with pytest.raises(JobStateError, match="artifact identity"):
-        store.advance("job-123", "validated")
-    head_sha = "a" * 40
-    digest = "b" * 64
-    store.record_artifact_identity("job-123", head_sha, digest)
-    with pytest.raises(JobStateError, match="already recorded"):
-        store.record_artifact_identity("job-123", "c" * 40, "d" * 64)
-    store.advance("job-123", "validated")
-    store.advance("job-123", "ready")
-    store.close()
-
-    reopened = JobStore.open(tmp_path / "private" / "jobs.sqlite3")
-    record = reopened.get("job-123")
-    assert record.state == "ready"
-    assert record.artifact_head_sha == head_sha
-    assert record.artifact_sha256 == digest
-    assert reopened.reconcile_restart() == ()
-    reopened.close()
-
-
-def test_artifact_identity_rejects_invalid_values_and_wrong_state(tmp_path: Path, context) -> None:
-    store = new_store(tmp_path)
-    create_job(store, context)
-    with pytest.raises(JobStateError, match="artifact identity"):
-        store.record_artifact_identity("job-123", "a" * 40, "b" * 64)
-    store.advance("job-123", "lease_held")
-    store.record_token_expiry("job-123", datetime.now(UTC) + timedelta(hours=1))
-    for state in ("dispatching", "dispatched", "artifact_received"):
-        store.advance("job-123", state)
-    for head_sha, digest in (("not-a-sha", "b" * 64), ("a" * 40, "not-a-digest")):
-        with pytest.raises(JobStateError, match="artifact identity"):
-            store.record_artifact_identity("job-123", head_sha, digest)
-    assert store.get("job-123").artifact_head_sha is None
-    store.close()
-
-
-@pytest.mark.parametrize("prior_state", ["dispatched", "ready"])
-def test_schema_v2_journal_migrates_without_losing_dispatch_evidence(
-    tmp_path: Path, context, prior_state: str
-) -> None:
-    directory = tmp_path / "private"
-    directory.mkdir(mode=0o700)
-    db = directory / "jobs.sqlite3"
-    connection = sqlite3.connect(db)
-    connection.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
-    connection.execute("INSERT INTO schema_version VALUES (2)")
-    connection.execute(
-        """CREATE TABLE jobs (
-            job_id TEXT PRIMARY KEY, worker_id TEXT NOT NULL,
-            lease_owner TEXT NOT NULL, root TEXT NOT NULL, target_repo TEXT NOT NULL,
-            head TEXT NOT NULL, branch TEXT NOT NULL, read_paths TEXT NOT NULL,
-            write_paths TEXT NOT NULL, snapshot_digest TEXT NOT NULL,
-            control_branch TEXT NOT NULL, artifact_path TEXT NOT NULL,
-            state TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-            token_expires_at TEXT
-        )"""
-    )
-    now = datetime.now(UTC).isoformat()
-    expiry = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
-    connection.execute(
-        "INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            "job-123",
-            "worker-a",
-            "test-owner",
-            str(context.root),
-            context.target_repo,
-            context.head,
-            context.branch,
-            '["module.py"]',
-            '["module.py"]',
-            context.snapshot_digest,
-            "grokbot/job-coding-1234abcd",
-            "artifacts/patch-1234abcd.json",
-            prior_state,
-            now,
-            now,
-            expiry,
-        ),
-    )
-    connection.commit()
-    connection.close()
-    db.chmod(0o600)
-
-    store = JobStore.open(db)
-    assert store.reconcile_restart() == (("job-123",) if prior_state == "dispatched" else ())
-    record = store.get("job-123")
-    assert record.state == "uncertain"
-    assert record.token_expires_at.isoformat() == expiry
-    assert record.artifact_head_sha is None
-    assert record.artifact_sha256 is None
-    store.close()
-    with sqlite3.connect(db) as check:
-        assert check.execute("SELECT version FROM schema_version").fetchone()[0] == 5
-
-
-def test_artifact_digest_is_canonical_and_rejects_non_json_values() -> None:
-    one = {"job_id": "job-123", "paths": ["src/module.py"], "summary": "change"}
-    two = {"summary": "change", "paths": ["src/module.py"], "job_id": "job-123"}
-    assert artifact_digest(one) == artifact_digest(two)
-    assert len(artifact_digest(one)) == 64
-    assert artifact_digest({**one, "summary": "changed"}) != artifact_digest(one)
-    with pytest.raises(JobStateError, match="artifact"):
-        artifact_digest({"invalid": float("nan")})
+if __name__ == "__main__":
+    unittest.main()

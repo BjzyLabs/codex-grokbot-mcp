@@ -1,48 +1,8 @@
-# Copy outside the repository, replace every example path, and chmod 0600.
-# Store only paths and repository names here; never store secret values.
-version = 1
-vault_address = "https://vault.example.invalid:8200"
-vault_mount = "secret"
-vault_role_id_file = "/absolute/private/location/role_id"
-vault_secret_id_file = "/absolute/private/location/secret_id"
-vault_ca_file = "/absolute/path/to/vault-ca.pem"
-github_ca_file = "/absolute/path/to/system-ca.pem"
-webhook_ca_file = "/absolute/path/to/system-ca.pem"
+# Copy outside the repository, replace every example value, and chmod 0600.
+# This file holds live credentials, so never commit it and never copy it back.
+version = 2
 job_database = "/absolute/private/location/jobs.sqlite3"
-control_repository = "example-org/private-control"
-# Omit both inbox keys to keep coding on the control-repository draft PR.
-# result_inbox_base_url = "https://inbox.example.invalid"
-# result_inbox_secret_path = "grokbot/inbox/requestor"
-# The Vault KV v2 secret above must contain a requestor_token field.
-
-[workers.coder_a]
-webhook_secret_path = "grokbot/webhooks/coder-a"
-app_secret_path = "grokbot/apps/coder-a"
-lease_prefix = "grokbot/leases"
-lease_worker = "coder-a"
-# job_types = ["coding"]
-# Diagnostics and X-query routing require all three fields below and an
-# explicitly configured, same-account Chief of Staff worker. The mapped
-# target must allow coding; Chief of Staff must allow x_query and
-# worker_diagnostic. x_query can only be sent to that mapped Chief of Staff.
-# account_id = "account-a"
-# diagnostic_chief_worker_id = "chief_a"
-# diagnostic_target_bot = "devcoder"
-
-# [workers.chief_a]
-# webhook_secret_path = "grokbot/webhooks/chief-a"
-# app_secret_path = "grokbot/apps/chief-a"
-# lease_prefix = "grokbot/leases"
-# lease_worker = "chief-a"
-# job_types = ["x_query", "worker_diagnostic"]
-# account_id = "account-a"
-
-[workers.coder_b]
-webhook_secret_path = "grokbot/webhooks/coder-b"
-app_secret_path = "grokbot/apps/coder-b"
-lease_prefix = "grokbot/leases"
-lease_worker = "coder-b"
-
-[workspaces."/absolute/path/to/project"]
-enabled = false
-workers = ["coder_a"]
+inbox_base_url = "https://inbox.example.invalid"
+inbox_requestor_token = "replace-with-the-inbox-requestor-credential"
+webhook_url = "https://webhook.example.invalid/grokbot"
+sender_key = "replace-with-the-webhook-sender-key"

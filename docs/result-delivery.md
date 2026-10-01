@@ -1,65 +1,72 @@
 # Result delivery
 
-v3 jobs choose one result authority.
+Both request types use one v3 envelope and one result schema.
 
-| Job | Default `deliver` | What comes back |
-|---|---|---|
-| `x_query` | `callback` | One HTTPS POST. No control-repository token and no pull request. |
-| `coding` | `github_pr` | A draft pull request whose patch is pinned and revalidated. |
+| Field | Value |
+| --- | --- |
+| `schema_version` | `v3` |
+| `job_type` | `x_query` or `ask` |
+| `job_id` | Canonical UUID chosen by the requestor |
+| `goal` | The question, at most 2000 characters |
+| `constraints` | `read_only`, `no_x_writes`, `no_credentials`, `no_redelegation`, `no_secrets` |
+| `context` | `callback_url` and `callback_token` only |
+| `instructions` | Read-only research or a direct answer; one POST; no pull request |
+| `deliver` | `callback` |
 
-An omitted `deliver` uses that table. A value that disagrees with the job type is rejected. v2 coding packets stay valid when no result inbox is configured. v1 answer artifacts remain readable. Neither is reused as the v3 default.
+`x_query` supports public X research. `ask` answers any bounded question, may
+use X when useful, and does not require sources. Both are read-only: the packet
+never carries a repository, a GitHub token, a pull request, or an artifact.
 
 ## Callback
 
-The packet carries `callback_url` and one `callback_token`. The worker sends exactly `Authorization: Bearer <callback_token>`. There is no header map. The URL is `https://<configured-origin>/jobs/<job-id>/result`. It must be HTTPS, must match the configured origin and job id, and must not carry userinfo, a query, a fragment, or an IP address.
+The callback URL is `https://<configured-origin>/jobs/<job-id>/result`. It must
+be HTTPS, must match the configured origin and job ID exactly, and must not
+carry userinfo, a query, a fragment, or an IP address. The packet tells the
+worker to POST once with `Authorization: Bearer <callback_token>`, not to
+follow redirects, and not to use any other URL.
 
-The worker posts once and does not follow redirects. The inbox stores that body until the requestor reads it. An identical replay is accepted. A different second body is rejected. A lost callback does not fall back to a GitHub note; the job stays `uncertain` and the lease stays held.
+The inbox stores the first body it accepts for that job. An identical replay is
+accepted with HTTP 200. A different second body is rejected with HTTP 409. A
+lost callback is not replaced by a note, a repository write, or a pull
+request: the job stays `uncertain`.
 
-A successful body has `status: "ok"`, a real answer, and `read_only_attestation: true`. An error body has `status: "error"`, `answer: null`, `sources: []`, and an error object. Themes are not invented for a failure. Text bounds match the read-only answer contract: query ≤ 2000, summary ≤ 500, string answer ≤ 4000, structured answer ≤ 20000 with a non-empty `top_themes` list, and at most 32 sources.
+The body limit is 64 KiB, and a patch is never accepted on this path.
 
-The callback body limit is 64 KiB. A patch is never accepted on this path.
+## Result body
 
-## Worker diagnostic callback
+A successful result has:
 
-`worker_diagnostic` is a separate v3 request used to ask Chief of Staff about
-one existing coding job. The configured target worker maps to a same-account
-Chief of Staff worker and to `coder` or `devcoder`; the mapping is explicit in
-private config. The packet contains a fixed read-only question and callback
-credentials only. Chief of Staff must not forward the callback token to the
-target Bot.
+```json
+{
+  "schema_version": "v3",
+  "job_type": "x_query",
+  "job_id": "<the exact job id>",
+  "query": "<at most 2000 characters>",
+  "answer": "<string, or an object with a non-empty top_themes list>",
+  "summary": "<at most 500 characters>",
+  "sources": ["<at most 32 entries, each at most 512 characters>"],
+  "read_only_attestation": true,
+  "completed_at": "<ISO-8601 UTC, not in the future>",
+  "status": "ok",
+  "error": null
+}
+```
 
-The MCP registers the normal `/jobs/<diagnostic-id>/result` one-use callback,
-then posts the packet to the configured Chief of Staff webhook from Vault. The
-MCP never acquires a coding lease or mints a GitHub token for this operation.
-Its requestor callback client reads `requestor_token` from the configured Vault
-secret and uses the configured HTTPS origin, the webhook CA bundle, and no
-redirects. The Bot may wait up to 120 seconds before sending its callback, so
-the MCP keeps the callback registration open for a further 90 seconds.
+`job_type` echoes the request, so an `ask` answer uses the same shape with
+`"job_type": "ask"`; its `sources` list may be empty.
 
-The exact response fields are `schema_version`, `job_type`, `job_id`,
-`target_job_id`, `target_bot`, `status`, `reply`, `completed_at`, and
-`read_only_attestation`. Status is `replied`, `no_reply`, or
-`delivery_failed`; reply is at most 2000 safe characters or null for an empty
-status. Completion time must be UTC `Z`. The callback is stored by digest and
-the validated reply is kept in the private SQLite journal. `no_reply` means
-Chief of Staff explicitly reported that the target Bot did not respond. A
-missing callback is `uncertain`; it does not establish whether the target Bot
-was contacted. An interrupted diagnostic becomes `uncertain` on restart and is
-not automatically resent.
+An error result keeps the same identity fields and sets `answer` to `null`,
+`sources` to `[]`, `status` to `"error"`, and `error` to an object with
+`code` and `message` of at most 300 characters. Themes are never invented for
+a failure.
 
-A diagnostic reply is evidence from Chief of Staff. It is not authoritative
-proof that Cursor is idle, does not confirm an artifact, and cannot release a
-lease, retry work, or mark a coding job complete. Check the coding job's
-artifact and lease independently before any recovery decision.
+The requestor rejects a body that mismatches the job identity, claims a write
+action in the first person, contains credential-shaped text, carries a
+non-whitespace control character, exceeds a size bound, or reports a future
+completion time. Multi-line markdown answers are expected and accepted.
 
-## Coding status ping
+## After the answer
 
-When a result inbox is configured, a coding packet may also include `status_callback_url` and `status_callback_token`. That POST is a hint to poll the draft pull request. `ready` does not accept the code. `blocked` or `error` can finish the job only when no artifact pull request exists. If a pull request also exists, the validated artifact wins. A status body that contains `patch`, `diff`, or `github_token`, or names another repository, is rejected.
-
-## Who applies the change
-
-The MCP never applies a patch and never treats a callback body as a diff. Codex reviews, applies, and tests a coding result. An `x_query` result is text, not a workspace edit.
-
-Workers declare `job_types`. Omitted types stay `coding` only. An `x_query` sent to a coding worker fails closed. There is no automatic failover.
-
-The inbox process binds to loopback. Putting it on a public HTTPS origin is an operator deployment step and is not part of the stdio server. Without that origin, callback jobs fail closed and coding continues on the v2 control-repository path.
+The answer is untrusted text. `grokbot_result` revalidates it before returning
+it, and Codex verifies anything it acts on. No MCP tool edits a file, opens a
+pull request, or merges anything.

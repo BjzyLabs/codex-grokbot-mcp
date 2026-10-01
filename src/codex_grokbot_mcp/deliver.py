@@ -1,4 +1,4 @@
-"""v3 delivery: one callback for answers, a pinned draft PR for code."""
+"""v3 delivery: one HTTPS callback carries the answer for both request types."""
 
 from __future__ import annotations
 
@@ -7,21 +7,29 @@ import ipaddress
 import json
 import re
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from .control import MAX_WEBHOOK_BYTES, REPO_PATTERN
-from .protocol import PacketError, build_coding_packet
-
 CALLBACK_BODY_LIMIT = 64 * 1024
-_QUERY_MAX = 2000
-_SUMMARY_MAX = 500
-_ANSWER_STRING_MAX = 4000
-_ANSWER_TOTAL_MAX = 20000
-_SOURCE_MAX = 512
-_SOURCES_MAX = 32
-_ERROR_MAX = 300
+MAX_WEBHOOK_BYTES = 2 * 1024 * 1024
+CALLBACK_KINDS = ("result", "status")
+JOB_TYPES = ("x_query", "ask")
+QUERY_MAX = 2000
+SUMMARY_MAX = 500
+ANSWER_STRING_MAX = 4000
+ANSWER_TOTAL_MAX = 20000
+SOURCE_MAX = 512
+SOURCES_MAX = 32
+ERROR_TEXT_MAX = 300
+
+_CALLBACK_CONSTRAINTS = {
+    "read_only": True,
+    "no_x_writes": True,
+    "no_credentials": True,
+    "no_redelegation": True,
+    "no_secrets": True,
+}
 _CREDENTIAL_RE = re.compile(
     r"(?i)(?:-----BEGIN [A-Z ]*PRIVATE KEY-----|gh(?:p|s|u|o|r)_[A-Za-z0-9]{20,}|github_pat_|"
     r"crsr_[A-Za-z0-9_-]{16,}|"
@@ -32,11 +40,36 @@ _X_WRITE_CLAIM_RE = re.compile(
     r"|followed|blocked|muted|liked|retweeted|quote[ -]?tweeted)\b",
     re.IGNORECASE,
 )
-_PR_URL_RE = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/(\d+)\Z")
-StatusDecision = Literal["poll", "blocked", "error"]
+
+_CALLBACK_BOOTSTRAP = (
+    "Before the POST, run sudo /workspace/.tailscale/ensure.sh and set "
+    "ALL_PROXY=socks5h://localhost:1055/.",
+)
+_X_QUERY_INSTRUCTIONS = (
+    "Do read-only research. Do not post, reply, message, follow, or modify an account.",
+    *_CALLBACK_BOOTSTRAP,
+    "POST the result once to callback_url using Authorization: Bearer and the callback token.",
+    "Do not follow redirects or use any other URL.",
+    "Do not open a pull request or use a GitHub token.",
+    "On failure set status to error, leave answer null, and do not invent themes.",
+)
+_ASK_INSTRUCTIONS = (
+    "Answer the question directly. X access is optional; this is not an X-only request.",
+    "Do not post, reply, message, follow, or modify any account.",
+    *_CALLBACK_BOOTSTRAP,
+    "POST the result once to callback_url using Authorization: Bearer and the callback token.",
+    "Do not follow redirects or use any other URL.",
+    "Do not open a pull request or use a GitHub token.",
+    "On failure set status to error, leave answer null, and do not invent sources.",
+)
+_INSTRUCTIONS = {"x_query": _X_QUERY_INSTRUCTIONS, "ask": _ASK_INSTRUCTIONS}
 
 
-def _canonical_job_id(job_id: str) -> str:
+class PacketError(ValueError):
+    """A proposed packet or returned callback body is invalid."""
+
+
+def canonical_job_id(job_id: str) -> str:
     try:
         canonical = str(UUID(job_id))
     except (ValueError, TypeError, AttributeError) as error:
@@ -46,8 +79,8 @@ def _canonical_job_id(job_id: str) -> str:
     return canonical
 
 
-def _goal(goal: str) -> str:
-    if not isinstance(goal, str) or not 0 < len(goal.strip()) <= _QUERY_MAX or "\x00" in goal:
+def clean_goal(goal: str) -> str:
+    if not isinstance(goal, str) or not 0 < len(goal.strip()) <= QUERY_MAX or "\x00" in goal:
         raise PacketError("goal is empty or exceeds its bound")
     return goal.strip()
 
@@ -77,21 +110,21 @@ def canonical_inbox_origin(value: str) -> str:
     return f"https://{parts.hostname}"
 
 
+def callback_url(origin: str, job_id: str, kind: str) -> str:
+    """Build the one callback or status URL for a job."""
+    if kind not in CALLBACK_KINDS:
+        raise PacketError("callback path is invalid")
+    canonical = canonical_job_id(job_id)
+    base = canonical_inbox_origin(origin)
+    return f"{base}/jobs/{canonical}/{kind}"
+
+
 def require_callback_target(value: str, *, origin: str, job_id: str, kind: str) -> str:
     """Reject any callback target other than the one configured for this job."""
     expected = callback_url(origin, job_id, kind)
     if value != expected:
         raise PacketError("callback URL does not match the job")
     return expected
-
-
-def callback_url(origin: str, job_id: str, kind: str) -> str:
-    """Build the one callback or status URL for a job."""
-    if kind not in ("result", "status"):
-        raise PacketError("callback path is invalid")
-    canonical = _canonical_job_id(job_id)
-    base = canonical_inbox_origin(origin)
-    return f"{base}/jobs/{canonical}/{kind}"
 
 
 def _token(value: str) -> str:
@@ -104,6 +137,42 @@ def _token(value: str) -> str:
     return value
 
 
+def _build_callback_packet(
+    *,
+    job_type: str,
+    job_id: str,
+    goal: str,
+    origin: str,
+    callback_token: str,
+    deliver: str | None,
+    forbidden: dict[str, object],
+) -> dict:
+    """Build one read-only callback packet with no control-repository authority."""
+    if forbidden:
+        raise PacketError("callback packet cannot carry a control-repo field")
+    canonical = canonical_job_id(job_id)
+    selected = "callback" if deliver is None else deliver
+    if selected != "callback":
+        raise PacketError(f"{job_type} deliver must be callback")
+    packet = {
+        "schema_version": "v3",
+        "job_type": job_type,
+        "job_id": canonical,
+        "goal": clean_goal(goal),
+        "constraints": dict(_CALLBACK_CONSTRAINTS),
+        "context": {
+            "callback_url": callback_url(origin, canonical, "result"),
+            "callback_token": _token(callback_token),
+        },
+        "instructions": list(_INSTRUCTIONS[job_type]),
+        "deliver": "callback",
+    }
+    raw = json.dumps(packet, separators=(",", ":")).encode("utf-8")
+    if len(raw) > MAX_WEBHOOK_BYTES:
+        raise PacketError(f"{job_type} packet exceeds webhook size limit")
+    return packet
+
+
 def build_x_query_packet(
     *,
     job_id: str,
@@ -113,171 +182,37 @@ def build_x_query_packet(
     deliver: str | None = None,
     **forbidden: object,
 ) -> dict:
-    """Build one read-only query packet with no control-repository authority."""
-    if forbidden:
-        raise PacketError("callback packet cannot carry a control-repo field")
-    canonical = _canonical_job_id(job_id)
-    selected = "callback" if deliver is None else deliver
-    if selected != "callback":
-        raise PacketError("x_query deliver must be callback")
-    packet = {
-        "schema_version": "v3",
-        "job_type": "x_query",
-        "job_id": canonical,
-        "goal": _goal(goal),
-        "constraints": {
-            "read_only": True,
-            "no_x_writes": True,
-            "no_credentials": True,
-            "no_redelegation": True,
-            "no_secrets": True,
-        },
-        "context": {
-            "callback_url": callback_url(origin, canonical, "result"),
-            "callback_token": _token(callback_token),
-        },
-        "instructions": [
-            "Do read-only research. Do not post, reply, message, follow, or modify an account.",
-            (
-                "POST the result once to callback_url using "
-                "Authorization: Bearer and the callback token."
-            ),
-            "Do not follow redirects or use any other URL.",
-            "Do not open a pull request or use a GitHub token.",
-            "On failure set status to error, leave answer null, and do not invent themes.",
-        ],
-        "deliver": "callback",
-    }
-    raw = json.dumps(packet, separators=(",", ":")).encode("utf-8")
-    if len(raw) > MAX_WEBHOOK_BYTES:
-        raise PacketError("coding packet exceeds webhook size limit")
-    return packet
+    """Build one read-only X research request that answers by callback."""
+    return _build_callback_packet(
+        job_type="x_query",
+        job_id=job_id,
+        goal=goal,
+        origin=origin,
+        callback_token=callback_token,
+        deliver=deliver,
+        forbidden=forbidden,
+    )
 
 
-def build_worker_diagnostic_packet(
+def build_ask_packet(
     *,
     job_id: str,
-    target_job_id: str,
-    target_bot: str,
+    goal: str,
     origin: str,
     callback_token: str,
-) -> dict:
-    """Build a read-only Bot-to-Bot status question with callback-only authority."""
-    diagnostic_id = _canonical_job_id(job_id)
-    target_id = _canonical_job_id(target_job_id)
-    if target_bot not in ("coder", "devcoder"):
-        raise PacketError("diagnostic target Bot is invalid")
-    packet = {
-        "schema_version": "v3",
-        "job_type": "worker_diagnostic",
-        "job_id": diagnostic_id,
-        "target_job_id": target_id,
-        "target_bot": target_bot,
-        "goal": (
-            f"Message {target_bot} and ask whether coding job {target_id} is still working, "
-            "stopped, or finished. Do not start, stop, retry, or change any job, files, or "
-            "GitHub PRs. Never forward callback credentials."
-        ),
-        "constraints": {
-            "read_only": True,
-            "no_job_changes": True,
-            "no_credentials": True,
-            "no_secrets": True,
-        },
-        "context": {
-            "callback_url": callback_url(origin, diagnostic_id, "result"),
-            "callback_token": _token(callback_token),
-        },
-        "deliver": "callback",
-        "max_wait_seconds": 120,
-    }
-    raw = json.dumps(packet, separators=(",", ":")).encode("utf-8")
-    if len(raw) > MAX_WEBHOOK_BYTES:
-        raise PacketError("diagnostic packet exceeds webhook size limit")
-    return packet
-
-
-def validate_worker_diagnostic_result(
-    job_id: str,
-    target_job_id: str,
-    target_bot: str,
-    body: Any,
-    *,
-    now: datetime,
-    forbidden_values: tuple[str, ...] = (),
-) -> dict:
-    """Validate the exact callback envelope; replies remain advisory evidence."""
-    diagnostic_id = _canonical_job_id(job_id)
-    target_id = _canonical_job_id(target_job_id)
-    if target_bot not in ("coder", "devcoder") or not isinstance(body, dict):
-        raise PacketError("diagnostic callback is invalid")
-    fields = {
-        "schema_version",
-        "job_type",
-        "job_id",
-        "target_job_id",
-        "target_bot",
-        "status",
-        "reply",
-        "completed_at",
-        "read_only_attestation",
-    }
-    if set(body) != fields:
-        raise PacketError("diagnostic callback fields are invalid")
-    if (
-        body["schema_version"] != "v3"
-        or body["job_type"] != "worker_diagnostic"
-        or body["job_id"] != diagnostic_id
-        or body["target_job_id"] != target_id
-        or body["target_bot"] != target_bot
-        or body["read_only_attestation"] is not True
-    ):
-        raise PacketError("diagnostic callback identity does not match")
-    if not isinstance(body["completed_at"], str) or not body["completed_at"].endswith("Z"):
-        raise PacketError("diagnostic completion time must use UTC Z notation")
-    completed = _utc(body["completed_at"], "diagnostic completion time")
-    if completed > now.astimezone(UTC):
-        raise PacketError("diagnostic completion time is in the future")
-    status = body["status"]
-    reply = body["reply"]
-    if status == "replied":
-        _safe_text(reply, "diagnostic reply", 2000)
-        if any(value and value in reply for value in forbidden_values):
-            raise PacketError("diagnostic reply contains a request credential")
-    elif status in ("no_reply", "delivery_failed"):
-        if reply is not None:
-            raise PacketError("empty diagnostic status must not include a reply")
-    else:
-        raise PacketError("diagnostic status is invalid")
-    return body
-
-
-def build_v3_coding_packet(
-    *,
     deliver: str | None = None,
-    status_callback: dict | None = None,
-    **coding: Any,
+    **forbidden: object,
 ) -> dict:
-    """Keep the v2 coding route and optionally add one status ping."""
-    selected = "github_pr" if deliver is None else deliver
-    if selected != "github_pr":
-        raise PacketError("coding deliver must be github_pr")
-    packet = build_coding_packet(**coding)
-    packet["schema_version"] = "v3"
-    packet["deliver"] = "github_pr"
-    if status_callback is not None:
-        job_id = packet["job_id"]
-        origin = status_callback.get("origin")
-        token = status_callback.get("token")
-        if not isinstance(origin, str) or not isinstance(token, str):
-            raise PacketError("status callback is incomplete")
-        packet["context"]["status_callback_url"] = callback_url(origin, job_id, "status")
-        packet["context"]["status_callback_token"] = _token(token)
-        packet["instructions"] = [
-            *packet["instructions"],
-            "POST one status ping to status_callback_url. Do not include the patch or token.",
-        ]
-    return packet
+    """Build one read-only general question that answers by callback."""
+    return _build_callback_packet(
+        job_type="ask",
+        job_id=job_id,
+        goal=goal,
+        origin=origin,
+        callback_token=callback_token,
+        deliver=deliver,
+        forbidden=forbidden,
+    )
 
 
 def _utc(value: str, label: str) -> datetime:
@@ -292,7 +227,7 @@ def _utc(value: str, label: str) -> datetime:
     return parsed.astimezone(UTC)
 
 
-def _safe_text(value: str, label: str, maximum: int) -> None:
+def _safe_text(value: Any, label: str, maximum: int) -> None:
     if (
         not isinstance(value, str)
         or not value
@@ -322,27 +257,69 @@ def _strings(value: Any) -> list[str]:
 
 def _reject_answer_strings(texts: list[str], label: str) -> None:
     for text in texts:
-        if any(
-            ord(character) < 32 and not character.isspace() for character in text
-        ) or _CREDENTIAL_RE.search(text):
+        if any(ord(character) < 32 and not character.isspace() for character in text):
+            raise PacketError(f"{label} is unsafe")
+        if _CREDENTIAL_RE.search(text):
             raise PacketError(f"{label} is unsafe")
         if _X_WRITE_CLAIM_RE.search(text):
             raise PacketError(f"{label} claims a write action")
 
 
-def validate_x_query_result(job_id: str, body: dict, *, now: datetime) -> dict:
-    """Accept one callback body or reject it closed."""
+def _validate_ok_answer(answer: Any) -> None:
+    if isinstance(answer, str):
+        _safe_text(answer, "answer", ANSWER_STRING_MAX)
+        if _X_WRITE_CLAIM_RE.search(answer):
+            raise PacketError("answer claims a write action")
+        return
+    if isinstance(answer, dict):
+        themes = answer.get("top_themes")
+        if not isinstance(themes, list) or not themes:
+            raise PacketError("structured answer must include themes")
+        texts = _strings(answer)
+        if sum(len(text) for text in texts) > ANSWER_TOTAL_MAX:
+            raise PacketError("answer exceeds the total size bound")
+        _reject_answer_strings(texts, "answer")
+        return
+    raise PacketError("answer must be a string or object")
+
+
+def _validate_sources(sources: Any) -> None:
+    if not isinstance(sources, list) or len(sources) > SOURCES_MAX:
+        raise PacketError("sources exceed the bound")
+    for source in sources:
+        if isinstance(source, str):
+            _safe_text(source, "source", SOURCE_MAX)
+        elif isinstance(source, dict):
+            texts = _strings(source)
+            if not texts:
+                raise PacketError("source is unsafe")
+            for text in texts:
+                _safe_text(text, "source", SOURCE_MAX)
+        else:
+            raise PacketError("source is unsafe")
+
+
+def validate_result(
+    job_id: str,
+    expected_job_type: str,
+    body: Any,
+    *,
+    now: datetime,
+) -> dict:
+    """Accept one callback body for the expected request type, or reject it closed."""
+    if expected_job_type not in JOB_TYPES:
+        raise PacketError("expected job type is invalid")
     if not isinstance(body, dict):
         raise PacketError("callback body is invalid")
-    canonical = _canonical_job_id(job_id)
-    if body.get("schema_version") != "v3" or body.get("job_type") != "x_query":
+    canonical = canonical_job_id(job_id)
+    if body.get("schema_version") != "v3" or body.get("job_type") != expected_job_type:
         raise PacketError("callback body does not match the job")
     if body.get("job_id") != canonical:
         raise PacketError("callback body does not match the job")
     if body.get("read_only_attestation") is not True:
         raise PacketError("callback body must attest read-only")
-    _safe_text(body.get("query"), "query", _QUERY_MAX)
-    _safe_text(body.get("summary"), "summary", _SUMMARY_MAX)
+    _safe_text(body.get("query"), "query", QUERY_MAX)
+    _safe_text(body.get("summary"), "summary", SUMMARY_MAX)
     completed = _utc(body.get("completed_at"), "completed_at")
     if completed > now.astimezone(UTC):
         raise PacketError("callback completion time is in the future")
@@ -358,88 +335,11 @@ def validate_x_query_result(job_id: str, body: dict, *, now: datetime) -> dict:
         error = body.get("error")
         if not isinstance(error, dict) or set(error) != {"code", "message"}:
             raise PacketError("error callback is incomplete")
-        _safe_text(error["code"], "error code", 80)
-        _safe_text(error["message"], "error message", _ERROR_MAX)
+        _safe_text(error["code"], "error code", ERROR_TEXT_MAX)
+        _safe_text(error["message"], "error message", ERROR_TEXT_MAX)
     else:
         raise PacketError("callback status is invalid")
     return body
-
-
-def _validate_ok_answer(answer: Any) -> None:
-    if isinstance(answer, str):
-        _safe_text(answer, "answer", _ANSWER_STRING_MAX)
-        if _X_WRITE_CLAIM_RE.search(answer):
-            raise PacketError("answer claims a write action")
-        return
-    if isinstance(answer, dict):
-        themes = answer.get("top_themes")
-        if not isinstance(themes, list) or not themes:
-            raise PacketError("structured answer must include themes")
-        texts = _strings(answer)
-        if sum(len(text) for text in texts) > _ANSWER_TOTAL_MAX:
-            raise PacketError("answer exceeds the total size bound")
-        _reject_answer_strings(texts, "answer")
-        return
-    raise PacketError("answer must be a string or object")
-
-
-def _validate_sources(sources: Any) -> None:
-    if not isinstance(sources, list) or len(sources) > _SOURCES_MAX:
-        raise PacketError("sources exceed the bound")
-    for source in sources:
-        if isinstance(source, str):
-            _safe_text(source, "source", _SOURCE_MAX)
-        elif isinstance(source, dict):
-            texts = _strings(source)
-            if not texts:
-                raise PacketError("source is unsafe")
-            for text in texts:
-                _safe_text(text, "source", _SOURCE_MAX)
-        else:
-            raise PacketError("source is unsafe")
-
-
-def validate_status_body(job_id: str, body: dict, *, control_repo: str) -> dict:
-    """Reject a status ping that carries a patch or a foreign pull request."""
-    if not isinstance(body, dict):
-        raise PacketError("status body is invalid")
-    if "patch" in body or "github_token" in body or "diff" in body:
-        raise PacketError("status body cannot carry a patch")
-    canonical = _canonical_job_id(job_id)
-    if (
-        body.get("schema_version") != "v3"
-        or body.get("job_type") != "coding"
-        or body.get("job_id") != canonical
-    ):
-        raise PacketError("status body does not match the job")
-    if body.get("status") not in ("ready", "blocked", "error"):
-        raise PacketError("status body is invalid")
-    _safe_text(body.get("summary"), "summary", _SUMMARY_MAX)
-    _utc(body.get("completed_at"), "completed_at")
-    pr_url = body.get("pr_url")
-    if pr_url is not None:
-        match = _PR_URL_RE.fullmatch(pr_url) if isinstance(pr_url, str) else None
-        if (
-            match is None
-            or match.group(1) != control_repo
-            or not REPO_PATTERN.fullmatch(control_repo)
-        ):
-            raise PacketError("status pull request is foreign")
-    elif body.get("status") == "ready":
-        raise PacketError("ready status requires the draft pull request")
-    return body
-
-
-def interpret_status(body: dict, *, artifact_present: bool) -> StatusDecision:
-    """A ready ping only asks for a poll. An artifact outranks a blocker."""
-    status = body.get("status")
-    if artifact_present or status == "ready":
-        return "poll"
-    if status == "blocked":
-        return "blocked"
-    if status == "error":
-        return "error"
-    raise PacketError("status body is invalid")
 
 
 def body_digest(body: bytes) -> str:

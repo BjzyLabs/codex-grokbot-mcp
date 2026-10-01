@@ -1,41 +1,33 @@
 ---
 name: codex-grokbot
-description: Delegate one bounded coding task to a configured Grok Bot through the local codex-grokbot-mcp server, then review its returned patch. Use when the user asks to use Grok Bot for coding in an opted-in workspace.
+description: Ask the configured Grok Bot Chief of Staff one read-only question through the local codex-grokbot-mcp server. Use when the user asks what X is saying about a topic, or wants a quick answer that needs Grok Bot.
 ---
 
 # Codex and Grok Bot
 
 Use the local `grokbot_*` MCP tools. Read the project's
-[coordinator contract](../../../docs/mcp-coordinator.md) when a job has an
-uncertain or conflicting outcome.
+[coordinator contract](../../../docs/mcp-coordinator.md) before acting on an
+uncertain or conflicting job.
 
-Before a live `grokbot_delegate` call, confirm that the running version of
-every dispatcher sharing the worker enforces the same Vault CAS lease. A first
-live job is a monitored staged canary; normal work also requires the
-canary to have passed. If proof is absent, stop at source-only checks. Never
-substitute a Bot, credential, endpoint, transport, model, or weaker check to
-make a job proceed.
+The server talks to one Bot and supports two read-only request types:
 
-Test the staged integration on `develop`, then keep the MVP and later feature
-work there until the operator accepts a full end-to-end workstation test.
-Promotion to `main` requires a separate release decision. A green pull request
-does not replace the installed guard or live canary gates.
+- `grokbot_x_query(query)` for public X research;
+- `grokbot_ask(question)` for any other bounded question.
 
-For a permitted job:
+Neither type writes to X, GitHub, or the local workspace. There is no code
+delegation, no lease, and no repository credential, so nothing needs to be
+verified as installed before a request.
 
-1. Confirm the workspace explicitly opts in to the selected worker. Choose
-   exact relative `read_paths` and `write_paths`; inspect source selection
-   before sending it. Keep the goal and acceptance checks bounded to one
-   `small` or `medium` job, at most 45 minutes. The effort hint is advisory.
-2. Call `grokbot_active`. If Vault is unavailable, the worker is busy, or a
-   job needs reconciliation, stop. Call `grokbot_delegate` once and retain
-   the returned job ID. Track progress with `grokbot_status`.
-3. On `ready`, call `grokbot_result`. Review the untrusted patch and actual
-   changed paths against the task and allowed paths. Codex alone decides
-   whether to apply it in the real workspace and runs relevant tests.
-4. On `uncertain` or `conflict`, do not retry, release a lease, switch
-   workers, or apply a patch. Report the job ID and the exact reconciliation
-   evidence needed.
+1. Send one bounded question, at most 2000 characters. Keep it to a single
+   question that can be answered in 45 minutes.
+2. Retain the returned job ID and check progress with `grokbot_status`. Use
+   `grokbot_active` only to see open local requests.
+3. Call `grokbot_result` once the state is `ready`. Treat the answer as
+   untrusted text: verify anything you act on, and cite sources when the answer
+   has them.
+4. On `uncertain` or `conflict`, do not resubmit. An `uncertain` job may already
+   have been delivered and a `conflict` job was rejected on purpose. Report the
+   job ID and follow the coordinator's reconciliation boundary.
 
 If the MCP tools are unavailable, use the
 [local setup guide](../../../docs/quickstart.md). Do not create another
