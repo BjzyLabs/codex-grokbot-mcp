@@ -215,9 +215,7 @@ class Coordinator:
         try:
             validated = validate_result(record.job_id, record.job_type, body, now=datetime.now(UTC))
         except (PacketError, TypeError) as error:
-            LOGGER.warning(
-                "request %s callback failed validation: %s", record.job_id[:8], error
-            )
+            LOGGER.warning("request %s callback failed validation: %s", record.job_id[:8], error)
             self._record_conflict(record.job_id, "invalid_result", str(error))
             self._settle_state(record.job_id, "conflict")
             return

@@ -226,9 +226,7 @@ class CoordinatorTests(unittest.TestCase):
     def test_placeholder_completed_at_conflicts_with_the_reason_recorded(self) -> None:
         transport = RecordingTransport(
             self.inbox,
-            responder=lambda packet: ok_body(
-                packet["job_id"], "ask", completed_at="PLACEHOLDER"
-            ),
+            responder=lambda packet: ok_body(packet["job_id"], "ask", completed_at="PLACEHOLDER"),
         )
 
         async def scenario():
