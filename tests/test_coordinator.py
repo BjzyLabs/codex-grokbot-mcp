@@ -218,7 +218,33 @@ class CoordinatorTests(unittest.TestCase):
 
         result = self.run_scenario(transport, scenario)
 
-        self.assertEqual(result, {"job_id": transport.packet["job_id"], "state": "conflict"})
+        self.assertEqual(result["job_id"], transport.packet["job_id"])
+        self.assertEqual(result["state"], "conflict")
+        self.assertEqual(result["error_code"], "invalid_result")
+        self.assertTrue(result["error_message"])
+
+    def test_placeholder_completed_at_conflicts_with_the_reason_recorded(self) -> None:
+        transport = RecordingTransport(
+            self.inbox,
+            responder=lambda packet: ok_body(packet["job_id"], "ask", completed_at="PLACEHOLDER"),
+        )
+
+        async def scenario():
+            coordinator = self.coordinator()
+            started = await coordinator.start("ask", "What changed today?")
+            job_id = started["job_id"]
+            await wait_until(lambda: self.state(job_id) == "conflict")
+            result = await coordinator.result(job_id)
+            await coordinator.shutdown()
+            return result
+
+        with self.assertLogs(coordinator_module.LOGGER, level="WARNING") as captured:
+            result = self.run_scenario(transport, scenario)
+
+        self.assertEqual(result["state"], "conflict")
+        self.assertEqual(result["error_code"], "invalid_result")
+        self.assertEqual(result["error_message"], "completed_at is invalid")
+        self.assertTrue(any("failed validation" in line for line in captured.output))
 
     def test_ambiguous_dispatch_is_uncertain_and_never_retried(self) -> None:
         transport = RecordingTransport(self.inbox, error=WebhookUncertain("lost response"))

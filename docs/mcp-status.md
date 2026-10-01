@@ -16,8 +16,9 @@ server holds no lease and cannot see the Bot's own queue.
 
 `grokbot_result(job_id)` returns state only until the request is terminal. A
 `ready` request is revalidated from the stored callback body; a `failed` request
-reports its recorded error code and message; a `conflict` or `uncertain`
-request reports only its state.
+reports its recorded error code and message; a `conflict` request reports its
+state plus the recorded validation reason; an `uncertain` request reports only
+its state.
 
 These tools never post a request twice, never retry an uncertain webhook
 outcome, and never accept a patch. See
