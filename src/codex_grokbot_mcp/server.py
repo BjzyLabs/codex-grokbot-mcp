@@ -11,6 +11,7 @@ from typing import Any
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
+from codex_grokbot_mcp import __version__
 from codex_grokbot_mcp.config import Config, ConfigError
 from codex_grokbot_mcp.coordinator import Coordinator, CoordinatorError
 from codex_grokbot_mcp.inbox import InboxClient, InboxError
@@ -40,7 +41,7 @@ def create_server(config: Config, store: JobStore, *, inbox: Any = None) -> MCPS
 
     server = MCPServer(
         name="codex-grokbot-mcp",
-        version="0.0.0",
+        version=__version__,
         instructions=INSTRUCTIONS,
         lifespan=lifespan,
     )

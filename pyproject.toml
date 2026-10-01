@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "codex-grokbot-mcp"
-version = "0.0.0"
+dynamic = ["version"]
 description = "Read-only Codex to Grok Bot Chief of Staff requests over local MCP"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -16,6 +16,9 @@ dev = ["pytest>=8,<9", "ruff>=0.12,<1"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/codex_grokbot_mcp"]
+
+[tool.hatch.version]
+path = "src/codex_grokbot_mcp/__init__.py"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
