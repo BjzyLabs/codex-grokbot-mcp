@@ -55,6 +55,34 @@ class PacketTests(unittest.TestCase):
         self.assertIn("Answer the question directly", instructions)
         self.assertNotIn("GitHub", built["context"])
 
+    def test_both_requests_carry_complete_callback_result_contract(self) -> None:
+        required = (
+            '"schema_version": "v3"',
+            '"job_type"',
+            '"job_id"',
+            '"query"',
+            '"answer"',
+            '"summary"',
+            '"sources"',
+            '"read_only_attestation": true',
+            '"completed_at"',
+            '"status": "ok"',
+            '"error": null',
+            "copy job_type and job_id from this packet",
+            "copy goal into query",
+            "UTC ISO-8601",
+            "context.callback_url",
+            "context.callback_token",
+            "error.code and error.message",
+        )
+        for job_type in ("ask", "x_query"):
+            with self.subTest(job_type=job_type):
+                instructions = " ".join(packet(job_type)["instructions"])
+                for requirement in required:
+                    self.assertIn(requirement, instructions)
+                self.assertIn("sudo /workspace/.tailscale/ensure.sh", instructions)
+                self.assertIn("ALL_PROXY=socks5h://localhost:1055/", instructions)
+
     def test_both_builders_trim_the_goal(self) -> None:
         for job_type in ("x_query", "ask"):
             with self.subTest(job_type=job_type):
