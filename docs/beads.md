@@ -5,6 +5,11 @@ Use Beads 1.3 or later with its embedded Dolt backend. Runtime state under
 repository's `refs/dolt/data` ref through `bd dolt push`. Do not edit JSONL
 exports, commit the database, or force-push task history.
 
+The migrated database and task `cgm-2km` are currently retained locally.
+Publication to the public Dolt ref awaits separate approval; do not discard
+that database before approved sync and fresh-checkout verification. The legacy
+export remains recoverable from Git history.
+
 ## Existing and new checkouts
 
 For a new checkout, initialize from an approved task-history remote:

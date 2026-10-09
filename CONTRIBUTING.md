@@ -8,3 +8,7 @@ Keep `.beads/` runtime state out of Git and review task history before `bd dolt 
 Start feature work from `develop` on a task branch. Open tested PRs to `develop`. Promote `develop` to `main` only after milestone acceptance. Keep commits conventional, such as `feat(protocol): validate patch paths`.
 
 Before pushing, review `git diff --cached`, `git ls-files`, and Git history; run tests, lint, Gitleaks, and the local private denylist check documented in the README. The private denylist is kept outside this repository. Never use `git add --force` to include ignored private context.
+
+The narrow owner-approved legacy metadata exceptions are documented in
+[the public identifier policy](docs/public-hygiene.md). Staged content and
+new private identifiers remain blocked.

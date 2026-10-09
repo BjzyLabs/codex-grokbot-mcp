@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import contextlib
+import hashlib
+import io
+import runpy
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "check_public_hygiene.py"
 PACKAGE = Path(__file__).resolve().parents[1] / "src" / "codex_grokbot_mcp"
@@ -133,6 +138,99 @@ class PublicHygieneScriptTests(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn(marker, result.stdout + result.stderr)
+
+    def check_with_history_exception(
+        self, path: str, data: bytes, allowed: str, denylist: Path
+    ) -> tuple[int, str]:
+        scanner = runpy.run_path(str(SCRIPT))
+        exceptions = {
+            (path, hashlib.sha256(data).hexdigest()): frozenset(
+                {hashlib.sha256(allowed.lower().encode()).hexdigest()}
+            )
+        }
+        output = io.StringIO()
+        with (
+            mock.patch.dict(scanner["HISTORICAL_EXCEPTIONS"], exceptions, clear=True),
+            contextlib.chdir(self.repo),
+            contextlib.redirect_stdout(output),
+            contextlib.redirect_stderr(output),
+        ):
+            status = scanner["main"](["--denylist", str(denylist)])
+        return status, output.getvalue()
+
+    def historical_fixture(self, data: bytes, path: str = "fixture.py") -> None:
+        fixture = self.repo / path
+        fixture.write_bytes(data)
+        git(self.repo, "add", path)
+        self.commit("legacy fixture")
+        fixture.write_text("Synthetic current fixture.\n")
+        git(self.repo, "add", path)
+        self.commit("remove legacy identifier")
+
+    def test_exact_approved_historical_match_passes(self) -> None:
+        marker = "legacy-mount"
+        data = f'mount = "{marker}"\n'.encode()
+        self.historical_fixture(data)
+        status, output = self.check_with_history_exception(
+            "fixture.py", data, marker, self.denylist(marker + "\n")
+        )
+        self.assertEqual(status, 0, output)
+        self.assertNotIn(marker, output)
+
+    def test_reintroduced_approved_blob_still_fails_staged_check(self) -> None:
+        marker = "legacy-mount"
+        data = f'mount = "{marker}"\n'.encode()
+        self.historical_fixture(data)
+        (self.repo / "fixture.py").write_bytes(data)
+        git(self.repo, "add", "fixture.py")
+        status, output = self.check_with_history_exception(
+            "fixture.py", data, marker, self.denylist(marker + "\n")
+        )
+        self.assertEqual(status, 1)
+        self.assertNotIn(marker, output)
+
+    def test_changed_historical_blob_is_not_excepted(self) -> None:
+        marker = "legacy-mount"
+        data = f'mount = "{marker}"\n'.encode()
+        self.historical_fixture(data + b"# changed fixture\n")
+        status, _ = self.check_with_history_exception(
+            "fixture.py", data, marker, self.denylist(marker + "\n")
+        )
+        self.assertEqual(status, 1)
+
+    def test_historical_exception_requires_exact_path(self) -> None:
+        marker = "legacy-mount"
+        data = f'mount = "{marker}"\n'.encode()
+        self.historical_fixture(data, "different.py")
+        status, _ = self.check_with_history_exception(
+            "fixture.py", data, marker, self.denylist(marker + "\n")
+        )
+        self.assertEqual(status, 1)
+
+    def test_denied_filename_is_not_excepted_even_with_exact_content(self) -> None:
+        marker = "legacy-mount"
+        data = f'mount = "{marker}"\n'.encode()
+        path = marker + ".py"
+        self.historical_fixture(data, path)
+        git(self.repo, "rm", path)
+        self.commit("remove private filename")
+        status, output = self.check_with_history_exception(
+            path, data, marker, self.denylist(marker + "\n")
+        )
+        self.assertEqual(status, 1)
+        self.assertNotIn(marker, output)
+
+    def test_other_denied_term_in_approved_blob_still_fails(self) -> None:
+        marker = "legacy-mount"
+        other = "another-private-identifier"
+        data = f'mount = "{marker}"\nother = "{other}"\n'.encode()
+        self.historical_fixture(data)
+        status, output = self.check_with_history_exception(
+            "fixture.py", data, marker, self.denylist(marker + "\n" + other + "\n")
+        )
+        self.assertEqual(status, 1)
+        self.assertNotIn(marker, output)
+        self.assertNotIn(other, output)
 
 
 class RequestorModuleSetTests(unittest.TestCase):

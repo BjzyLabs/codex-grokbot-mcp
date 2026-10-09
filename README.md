@@ -92,3 +92,7 @@ gitleaks git --staged --redact
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+The narrow owner-approved legacy metadata exceptions are documented in
+[the public identifier policy](docs/public-hygiene.md). Staged content and
+new private identifiers remain blocked.
