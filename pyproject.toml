@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "codex-grokbot-mcp"
 dynamic = ["version"]
-description = "Read-only Codex to Grok Bot Chief of Staff requests over local MCP"
+description = "Read-only Codex to X Bot requests over local MCP"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
