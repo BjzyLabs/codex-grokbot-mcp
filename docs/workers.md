@@ -1,6 +1,6 @@
 # The single configured Bot
 
-This requestor talks to exactly one Grok Bot: the Chief of Staff behind the
+This requestor talks to exactly one X Bot behind the
 configured webhook. That identity is fixed in the configuration by its webhook
 URL and sender key; there is no worker table, no worker selection, and no
 fallback to another Bot. Cancelling a different account or Bot does not affect

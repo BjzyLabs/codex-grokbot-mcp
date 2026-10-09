@@ -70,6 +70,21 @@ class ServerTests(unittest.TestCase):
 
         self.assertEqual(asyncio.run(scenario()), TOOL_NAMES)
 
+    def test_client_is_told_it_is_talking_to_x_bot(self) -> None:
+        server = create_server(self.config, self.store, inbox=self.inbox)
+
+        async def scenario():
+            async with Client(server) as client:
+                tools = (await client.list_tools()).tools
+                return client.instructions, {tool.name: tool.description for tool in tools}
+
+        instructions, descriptions = asyncio.run(scenario())
+        self.assertIn("X Bot", instructions)
+        self.assertNotIn("Chief of Staff", instructions)
+        for name in ("grokbot_x_query", "grokbot_ask"):
+            self.assertIn("X Bot", descriptions[name])
+            self.assertNotIn("Chief of Staff", descriptions[name])
+
     def test_x_query_round_trip_through_the_tools(self) -> None:
         recorder = RecordingTransport(
             self.inbox, responder=lambda packet: ok_body(packet["job_id"], "x_query")

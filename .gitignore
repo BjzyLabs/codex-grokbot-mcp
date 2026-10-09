@@ -5,4 +5,6 @@ __pycache__/
 .ruff_cache/
 *.py[cod]
 *.egg-info/
-.beads/last-touched
+.beads/
+.beads.gate.lock*
+.dolt/

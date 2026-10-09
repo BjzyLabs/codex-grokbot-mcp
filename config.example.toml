@@ -1,8 +1,7 @@
-# Copy outside the repository, replace every example value, and chmod 0600.
-# This file holds live credentials, so never commit it and never copy it back.
-version = 2
+# Copy outside Git, replace synthetic values, and chmod 0600.
+# Version 3 contains only settings and Vault references, never credentials.
+version = 3
 job_database = "/absolute/private/location/jobs.sqlite3"
 inbox_base_url = "https://inbox.example.invalid"
-inbox_requestor_token = "replace-with-the-inbox-requestor-credential"
-webhook_url = "https://webhook.example.invalid/grokbot"
-sender_key = "replace-with-the-webhook-sender-key"
+vault_webhook_path = "kvExample/Bots/XBotWebhook"
+vault_inbox_path = "kvExample/Bots/callback-inbox-requestor"

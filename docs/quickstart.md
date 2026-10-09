@@ -1,16 +1,18 @@
 # Local Codex setup
 
 This is a local stdio MCP server. Run it on the same host as Codex, with a
-reachable Grok Bot webhook and the callback inbox origin that Grok Bot can
+reachable X Bot webhook and the callback inbox origin that Grok Bot can
 reach. Python 3.12+ is required.
 
 ## Before connecting
 
-1. Confirm the Grok Bot routine accepts a v3 `x_query` or `ask` packet and
+1. Confirm the X Bot routine accepts a v3 `x_query` or `ask` packet and
    answers by callback. The payload contract is in
    [result delivery](result-delivery.md).
-2. Confirm the callback inbox is reachable from the Bot and that you hold its
-   requestor credential.
+2. Confirm the callback inbox is reachable from X Bot. Verify the two Vault
+   entries contain `webhook_url`/`sender_key` and `requestor_token`, and that the
+   existing non-root CLI session can read them. The MCP process needs `vault`
+   on `PATH`, an HTTPS `VAULT_ADDR`, and the established TLS CA configuration.
 3. Copy [the example configuration](../config.example.toml) to an owner-only
    regular file outside Git, replace every synthetic value, and `chmod 0600`
    it. The rules are in [configuration](configuration.md). Never put the

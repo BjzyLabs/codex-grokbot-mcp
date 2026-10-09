@@ -1,8 +1,8 @@
 # codex-grokbot-mcp
 
-A local, stdio MCP server that asks one configured Grok Bot two kinds of
+A local, stdio MCP server that asks one configured X Bot two kinds of
 read-only question and reads the answer back. There is no code delegation, no
-shared lease, no control repository, and no secret backend.
+shared lease or control repository. Credentials can be loaded from Vault at startup.
 
 The server posts one webhook packet and waits for one callback. Concurrency is
 safe because every request carries its own job ID and the callback inbox stores
@@ -15,7 +15,7 @@ The request path is implemented and covered by local tests: the packet and
 result contract, the private SQLite journal, the loopback inbox, the webhook
 transport, the coordinator, and the stdio tools. A live webhook and a
 published inbox origin remain operator deployment steps. Track bounded work in
-[Beads](.beads/README.md).
+[Beads](docs/beads.md).
 
 ## Request types
 
@@ -56,9 +56,10 @@ For installation and first use in Codex, follow the
 
 ## Security boundary
 
-- The owner-only configuration file is the only credential store. Nothing is
-  read from a secret backend, and no credential appears in a packet, a log, or
-  the journal.
+- Version 3 keeps only settings and Vault references in the owner-only config.
+  The webhook URL and credentials are loaded into memory with the existing
+  Vault CLI session. Version 2 remains available for existing file-based setups.
+  Sender and inbox credentials never appear in packets, logs, or the journal.
 - Every request is read-only. The packet forbids X writes, credentials,
   redelegation, repositories, and pull requests, and carries only one callback
   URL and one per-job callback token.
@@ -91,3 +92,7 @@ gitleaks git --staged --redact
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+The narrow owner-approved legacy metadata exceptions are documented in
+[the public identifier policy](docs/public-hygiene.md). Staged content and
+new private identifiers remain blocked.

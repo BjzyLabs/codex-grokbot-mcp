@@ -71,8 +71,8 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "missing or unknown"):
             self.load(text)
 
-    def test_version_must_be_exactly_two(self) -> None:
-        for version in ("1", "3", '"2"', "2.0"):
+    def test_unsupported_versions_are_rejected(self) -> None:
+        for version in ("1", "4", '"2"', "2.0"):
             with self.subTest(version=version):
                 with self.assertRaisesRegex(ConfigError, "version"):
                     self.load(config_text(self.root, version=version))
