@@ -1,4 +1,4 @@
-"""Webhook-only request coordinator for the configured Grok Bot Chief of Staff.
+"""Webhook-only request coordinator for the configured X Bot.
 
 One request becomes one webhook POST plus one callback. Concurrency is safe
 because every request is keyed by its own job ID and the inbox stores at most

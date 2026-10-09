@@ -8,9 +8,28 @@ separate gate; this tool checks locally known private identifiers and paths.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import subprocess
 import sys
 from pathlib import Path
+
+# Owner-approved legacy Vault-mount metadata; see docs/public-hygiene.md.
+# Keys pin path and exact content; values pin the one accepted identifier.
+# These exceptions never apply to staged files or filename matches.
+HISTORICAL_EXCEPTIONS: dict[tuple[str, str], frozenset[str]] = {
+    (
+        "tests/test_coordinator.py",
+        "4b1527ff3ea145f590427784ceb8cf453441ebd8ffe1825f4cf68b5e1257b2c8",
+    ): frozenset({"a35ce218f7056596e61505fa89baf28e1a54fbb178900be654c6db69a85a9083"}),
+    (
+        "tests/test_diagnostic_coordinator.py",
+        "f4b086057bec36dfa07751026fa044a8a6501f85360b3b67dc5813122ff02e7c",
+    ): frozenset({"a35ce218f7056596e61505fa89baf28e1a54fbb178900be654c6db69a85a9083"}),
+    (
+        "tests/test_diagnostic_coordinator.py",
+        "df5173e6dc0341c5bb4f14d3c46c8597687793a5553113379cd392beea4d0c89",
+    ): frozenset({"a35ce218f7056596e61505fa89baf28e1a54fbb178900be654c6db69a85a9083"}),
+}
 
 
 def git(*args: str) -> bytes:
@@ -49,10 +68,29 @@ def historical_blobs() -> list[tuple[str, bytes]]:
     return blobs
 
 
-def main() -> int:
+def denied_paths(
+    blobs: list[tuple[str, bytes]], terms: list[bytes], *, historical: bool = False
+) -> set[str]:
+    failures: set[str] = set()
+    for path, data in blobs:
+        accepted = (
+            HISTORICAL_EXCEPTIONS.get((path, hashlib.sha256(data).hexdigest()), frozenset())
+            if historical
+            else frozenset()
+        )
+        for term in terms:
+            if term in path.encode("utf-8").lower() or (
+                term in data.lower() and hashlib.sha256(term).hexdigest() not in accepted
+            ):
+                failures.add(path)
+                break
+    return failures
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--denylist", type=Path, required=True)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
         root = Path(git("rev-parse", "--show-toplevel").decode().strip()).resolve()
         denylist = args.denylist.resolve(strict=True)
@@ -65,10 +103,8 @@ def main() -> int:
         ]
         if not terms:
             raise ValueError("denylist must contain at least one identifier")
-        failures: set[str] = set()
-        for path, data in staged_blobs() + historical_blobs():
-            if any(term in path.encode("utf-8").lower() or term in data.lower() for term in terms):
-                failures.add(path)
+        failures = denied_paths(staged_blobs(), terms)
+        failures |= denied_paths(historical_blobs(), terms, historical=True)
         if failures:
             print(
                 f"Private identifier found in Git content ({len(failures)} blob(s)); "

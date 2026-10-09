@@ -1,9 +1,12 @@
 # Security model
 
-The local MCP process is the trusted requestor. It holds two credentials in one
-owner-only configuration file: the callback inbox requestor credential and the
-Grok Bot webhook sender key. Nothing else is stored: there is no secret
-backend, no repository credential, and no shared lease.
+The local MCP process is the trusted requestor. Version 3 reads the X Bot
+webhook URL, webhook sender key, and callback inbox requestor token from Vault
+into memory at startup. Its owner-only config contains only settings and Vault
+references. Version 2 retains credentials in a private file for compatibility.
+There is no repository credential or shared lease. Vault authentication uses
+the existing CLI session; startup rejects root and expired sessions, requires
+verified TLS, and fails closed on missing fields or failed reads.
 
 A request carries only a job ID, a question, read-only constraints, and one
 callback URL with one per-job token. The requestor never sends local paths,

@@ -1,6 +1,6 @@
 ---
 name: codex-grokbot
-description: Ask the configured Grok Bot Chief of Staff one read-only question through the local codex-grokbot-mcp server. Use when the user asks what X is saying about a topic, or wants a quick answer that needs Grok Bot.
+description: Ask the configured X Bot one read-only question through the local codex-grokbot-mcp server. Use when the user asks what X is saying about a topic, or wants a quick answer that needs Grok Bot.
 ---
 
 # Codex and Grok Bot

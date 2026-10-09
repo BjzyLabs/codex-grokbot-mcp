@@ -1,9 +1,12 @@
-"""Strict owner-only configuration for the one Grok Bot webhook requestor."""
+"""Owner-only configuration with optional runtime Vault loading for X Bot."""
 
 from __future__ import annotations
 
+import json
 import os
+import shutil
 import stat
+import subprocess
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -13,6 +16,8 @@ from urllib.parse import urlsplit
 from .deliver import PacketError, canonical_inbox_origin
 
 CURRENT_VERSION = 2
+VAULT_VERSION = 3
+VAULT_TIMEOUT = 20
 CONFIG_KEYS = frozenset(
     {
         "version",
@@ -22,6 +27,10 @@ CONFIG_KEYS = frozenset(
         "webhook_url",
         "sender_key",
     }
+)
+
+VAULT_CONFIG_KEYS = frozenset(
+    {"version", "job_database", "inbox_base_url", "vault_webhook_path", "vault_inbox_path"}
 )
 
 
@@ -70,9 +79,15 @@ def _inbox_origin(value: Any) -> str:
 
 
 def _webhook_url(value: Any) -> str:
-    if not isinstance(value, str):
+    if not isinstance(value, str) or any(
+        character.isspace() or ord(character) < 32 for character in value
+    ):
         raise ConfigError("webhook URL is invalid")
-    parts = urlsplit(value)
+    try:
+        parts = urlsplit(value)
+        _ = parts.port
+    except ValueError:
+        raise ConfigError("webhook URL is invalid") from None
     if (
         parts.scheme != "https"
         or not parts.hostname
@@ -84,13 +99,79 @@ def _webhook_url(value: Any) -> str:
     return value
 
 
+def _vault_path(value: Any) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value.split("/")) < 2
+        or any(part in ("", ".", "..") or part.startswith("-") for part in value.split("/"))
+        or any(character.isspace() or ord(character) < 32 for character in value)
+    ):
+        raise ConfigError("Vault path must name an exact mount and secret")
+    return value
+
+
+def _vault_json(arguments: list[str]) -> dict[str, Any]:
+    """Capture all CLI output; errors must never expose Vault payloads."""
+    executable = shutil.which("vault")
+    if executable is None:
+        raise ConfigError("Vault CLI is unavailable")
+    try:
+        result = subprocess.run(  # noqa: S603 -- resolved CLI, validated path, no shell
+            [executable, *arguments], capture_output=True, text=True, timeout=VAULT_TIMEOUT
+        )
+    except (OSError, subprocess.SubprocessError):
+        raise ConfigError("Vault CLI is unavailable or timed out") from None
+    if result.returncode:
+        raise ConfigError("Vault read failed; check session and exact-path access")
+    try:
+        body = json.loads(result.stdout)
+    except (ValueError, TypeError):
+        raise ConfigError("Vault returned an invalid response") from None
+    if not isinstance(body, dict) or not isinstance(body.get("data"), dict):
+        raise ConfigError("Vault returned an invalid response")
+    return body["data"]
+
+
+def _vault_credentials(webhook_path: str, inbox_path: str) -> tuple[str, str, str]:
+    """Use existing CLI authentication; never log in or persist fetched values."""
+    address = os.environ.get("VAULT_ADDR", "")
+    try:
+        _webhook_url(address)
+    except (ConfigError, ValueError):
+        raise ConfigError("VAULT_ADDR must be a verified HTTPS endpoint") from None
+    if os.environ.get("VAULT_SKIP_VERIFY", "").lower() not in ("", "false", "0"):
+        raise ConfigError("Vault TLS verification cannot be disabled")
+    session = _vault_json(["token", "lookup", "-format=json"])
+    policies = session.get("policies")
+    ttl = session.get("ttl")
+    if (
+        not isinstance(policies, list)
+        or not policies
+        or any(not isinstance(policy, str) for policy in policies)
+        or "root" in policies
+        or type(ttl) is not int
+        or ttl <= 0
+    ):
+        raise ConfigError("Vault requires an active non-root session with a positive TTL")
+    webhook = _vault_json(["kv", "get", "-format=json", webhook_path]).get("data")
+    if not isinstance(webhook, dict):
+        raise ConfigError("Vault webhook entry is invalid")
+    webhook_url = _webhook_url(webhook.get("webhook_url"))
+    sender_key = _secret(webhook.get("sender_key"), label="webhook sender key")
+    inbox = _vault_json(["kv", "get", "-format=json", inbox_path]).get("data")
+    if not isinstance(inbox, dict):
+        raise ConfigError("Vault inbox entry is invalid")
+    requestor_token = _secret(inbox.get("requestor_token"), label="callback inbox credential")
+    return webhook_url, sender_key, requestor_token
+
+
 @dataclass(frozen=True)
 class Config:
-    """Everything one requestor needs; the two secrets never appear in repr()."""
+    """Runtime values; credentials and the private webhook URL never appear in repr()."""
 
     job_database: Path
     inbox_base_url: str
-    webhook_url: str
+    webhook_url: str = field(repr=False)
     inbox_requestor_token: str = field(repr=False)
     sender_key: str = field(repr=False)
 
@@ -102,16 +183,28 @@ class Config:
                 source = tomllib.load(handle)
         except (OSError, tomllib.TOMLDecodeError) as error:
             raise ConfigError("configuration TOML cannot be read") from error
-        if not isinstance(source, dict) or set(source) != CONFIG_KEYS:
-            raise ConfigError("configuration has missing or unknown fields")
-        if type(source["version"]) is not int or source["version"] != CURRENT_VERSION:
+        version = source.get("version")
+        if type(version) is not int or version not in (CURRENT_VERSION, VAULT_VERSION):
             raise ConfigError("configuration version is unsupported")
-        return cls(
-            job_database=_absolute_path(source["job_database"], label="job database"),
-            inbox_base_url=_inbox_origin(source["inbox_base_url"]),
-            webhook_url=_webhook_url(source["webhook_url"]),
-            inbox_requestor_token=_secret(
+        expected = VAULT_CONFIG_KEYS if version == VAULT_VERSION else CONFIG_KEYS
+        if set(source) != expected:
+            raise ConfigError("configuration has missing or unknown fields")
+        database = _absolute_path(source["job_database"], label="job database")
+        origin = _inbox_origin(source["inbox_base_url"])
+        if version == VAULT_VERSION:
+            webhook_path = _vault_path(source["vault_webhook_path"])
+            inbox_path = _vault_path(source["vault_inbox_path"])
+            webhook_url, sender_key, requestor_token = _vault_credentials(webhook_path, inbox_path)
+        else:
+            webhook_url = _webhook_url(source["webhook_url"])
+            sender_key = _secret(source["sender_key"], label="webhook sender key")
+            requestor_token = _secret(
                 source["inbox_requestor_token"], label="callback inbox credential"
-            ),
-            sender_key=_secret(source["sender_key"], label="webhook sender key"),
+            )
+        return cls(
+            job_database=database,
+            inbox_base_url=origin,
+            webhook_url=webhook_url,
+            inbox_requestor_token=requestor_token,
+            sender_key=sender_key,
         )
