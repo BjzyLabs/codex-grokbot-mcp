@@ -1,6 +1,10 @@
 # Result delivery
 
 Both request types use one v3 envelope and one result schema.
+The packet carries the complete result contract in its instructions, including
+identity fields, success/error fields, Tailscale setup, and the exact callback
+target. A newly configured worker does not need prior chat context to return a
+valid result.
 
 | Field | Value |
 | --- | --- |

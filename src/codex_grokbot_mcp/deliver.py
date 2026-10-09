@@ -45,9 +45,26 @@ _CALLBACK_BOOTSTRAP = (
     "Before the POST, run sudo /workspace/.tailscale/ensure.sh and set "
     "ALL_PROXY=socks5h://localhost:1055/.",
 )
+_CALLBACK_RESULT_CONTRACT = (
+    'The result JSON must use this shape: {"schema_version": "v3", '
+    '"job_type": "same as packet", "job_id": "same as packet", "query": "packet goal", '
+    '"answer": "your answer", "summary": "short summary", "sources": [], '
+    '"read_only_attestation": true, "completed_at": "actual completion time", '
+    '"status": "ok", "error": null}. Replace the descriptive values: '
+    "copy job_type and job_id from this packet; copy goal into query. "
+    "Use the actual current UTC ISO-8601 completed_at, never a future timestamp.",
+    "Keep query within 2000 characters, summary within 500, and at most 32 source URLs "
+    "within 512 characters each. Do not include credentials in the result body. "
+    "For an error use status=error, answer=null, sources=[], and error.code and error.message "
+    "of at most 300 characters each.",
+    "POST exactly this JSON body once to context.callback_url, with Authorization: Bearer "
+    "using context.callback_token. Do not replace the supplied hostname or path. "
+    "A webhook receipt or chat reply is not callback delivery.",
+)
 _X_QUERY_INSTRUCTIONS = (
     "Do read-only research. Do not post, reply, message, follow, or modify an account.",
     *_CALLBACK_BOOTSTRAP,
+    *_CALLBACK_RESULT_CONTRACT,
     "POST the result once to callback_url using Authorization: Bearer and the callback token.",
     "Do not follow redirects or use any other URL.",
     "Do not open a pull request or use a GitHub token.",
@@ -57,6 +74,7 @@ _ASK_INSTRUCTIONS = (
     "Answer the question directly. X access is optional; this is not an X-only request.",
     "Do not post, reply, message, follow, or modify any account.",
     *_CALLBACK_BOOTSTRAP,
+    *_CALLBACK_RESULT_CONTRACT,
     "POST the result once to callback_url using Authorization: Bearer and the callback token.",
     "Do not follow redirects or use any other URL.",
     "Do not open a pull request or use a GitHub token.",
